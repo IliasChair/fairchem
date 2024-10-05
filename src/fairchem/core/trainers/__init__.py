@@ -6,8 +6,10 @@ from __future__ import annotations
 
 from .base_trainer import BaseTrainer
 from .ocp_trainer import OCPTrainer
+from .denoising_forces_trainer import DenoisingForcesTrainer
 
 __all__ = [
     "BaseTrainer",
     "OCPTrainer",
+    "DenoisingForcesTrainer"
 ]
