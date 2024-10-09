@@ -23,7 +23,7 @@ from fairchem.core.models.equiformer_v2.trainers.forces_trainer import (
     EquiformerV2ForcesTrainer,
 )
 from fairchem.core.modules.evaluator import mae
-from fairchem.core.modules.normalization.normalizer import Normalizer
+from fairchem.core.modules.normalization.normalizer import Normalizer, create_normalizer
 from fairchem.core.modules.scaling.util import ensure_fitted
 
 
@@ -314,14 +314,22 @@ class DenoisingForcesTrainer(EquiformerV2ForcesTrainer):
         self.denoising_pos_params.denoising_pos_coefficient = self.config["optim"][
             "denoising_pos_coefficient"
         ]
-        self.normalizers["denoising_pos_target"] = Normalizer(
+        # self.normalizers["denoising_pos_target"] = Normalizer(
+        #     mean=0.0,
+        #     std=(
+        #         self.denoising_pos_params.std
+        #         if self.denoising_pos_params.fixed_noise_std
+        #         else self.denoising_pos_params.std_high
+        #     ),
+        #     device=self.device,
+        # )
+        self.normalizers["denoising_pos_target"] = create_normalizer(
             mean=0.0,
-            std=(
+            stdev=(
                 self.denoising_pos_params.std
                 if self.denoising_pos_params.fixed_noise_std
                 else self.denoising_pos_params.std_high
             ),
-            device=self.device,
         )
 
     def train(self, disable_eval_tqdm=False):
