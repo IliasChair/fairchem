@@ -1,21 +1,51 @@
 from __future__ import annotations
 
+import contextlib
+import logging
 import math
+from functools import partial
 
 import torch
+import torch.nn as nn
+
+from fairchem.core.common import gp_utils
 from fairchem.core.common.registry import registry
 from fairchem.core.common.utils import conditional_grad
-
-try:
-    from e3nn import o3
-except ImportError:
-    pass
-
-from .equiformer_v2 import EquiformerV2Backbone
-from .so3 import SO3_Embedding, SO3_LinearV2
-from .transformer_block import (
-    SO2EquivariantGraphAttention,
+from fairchem.core.models.base import (
+    GraphModelMixin,
+    HeadInterface,
 )
+from fairchem.core.models.scn.smearing import GaussianSmearing
+
+with contextlib.suppress(ImportError):
+    from e3nn import o3
+
+
+import typing
+
+from fairchem.core.models.equiformer_v2.equiformer_v2 import (
+    EquiformerV2Backbone,
+    eqv2_init_weights,
+)
+from .module_list import ModuleListInfo
+from .radial_function import RadialFunction
+from .so3 import (
+    CoefficientMappingModule,
+    SO3_Embedding,
+    SO3_Grid,
+    SO3_LinearV2,
+    SO3_Rotation,
+)
+from .transformer_block import (
+    FeedForwardNetwork,
+    SO2EquivariantGraphAttention,
+    TransBlockV2,
+)
+
+if typing.TYPE_CHECKING:
+    from torch_geometric.data.batch import Batch
+
+    from fairchem.core.models.base import GraphData
 
 # Statistics of IS2RE 100K
 _AVG_NUM_NODES = 77.81317
@@ -115,12 +145,12 @@ class EquiformerV2S_OC20_DenoisingPos(EquiformerV2Backbone):
         use_atom_edge_embedding: bool = True,
         share_atom_edge_embedding: bool = False,
         use_m_share_rad: bool = False,
-        distance_function="gaussian",
+        distance_function: str = "gaussian",
         num_distance_basis: int = 512,
         attn_activation: str = "scaled_silu",
         use_s2_act_attn: bool = False,
         use_attn_renorm: bool = True,
-        ffn_activation="scaled_silu",
+        ffn_activation: str = "scaled_silu",
         use_gate_act: bool = False,
         use_grid_mlp: bool = False,
         use_sep_s2_act: bool = True,
@@ -227,11 +257,10 @@ class EquiformerV2S_OC20_DenoisingPos(EquiformerV2Backbone):
                 alpha_drop=0.0,
             )
 
-        self.apply(self._init_weights)
-        self.apply(self._uniform_init_rad_func_linear_weights)
+        self.apply(partial(eqv2_init_weights, weight_init=self.weight_init))
 
     @conditional_grad(torch.enable_grad())
-    def forward(self, data):
+    def forward(self, data: Batch) -> dict[str, torch.Tensor]:
         self.batch_size = len(data.natoms)
         self.dtype = data.pos.dtype
         self.device = data.pos.device
@@ -239,24 +268,35 @@ class EquiformerV2S_OC20_DenoisingPos(EquiformerV2Backbone):
         atomic_numbers = data.atomic_numbers.long()
         num_atoms = len(atomic_numbers)
 
-        (
-            edge_index,
-            edge_distance,
-            edge_distance_vec,
-            cell_offsets,
-            _,  # cell offset distances
-            neighbors,
-        ) = self.generate_graph(
+
+        # (
+        #     atomic_numbers_full,
+        #     batch_full,
+        #     cell_offsets,
+        #     edge_distance,
+        #     edge_distance_vec,
+        #     edge_index,
+        #     neighbors,
+        #     node_offset,
+        #     offset_distances,
+        # )= self.generate_graph(
+        #     data,
+        #     enforce_max_neighbors_strictly=self.enforce_max_neighbors_strictly,
+        # )
+        graph = self.generate_graph(
             data,
             enforce_max_neighbors_strictly=self.enforce_max_neighbors_strictly,
         )
+
 
         ###############################################################
         # Initialize data structures
         ###############################################################
 
         # Compute 3x3 rotation matrix per edge
-        edge_rot_mat = self._init_edge_rot_mat(data, edge_index, edge_distance_vec)
+        edge_rot_mat = self._init_edge_rot_mat(
+            data, graph.edge_index, graph.edge_distance_vec
+        )
 
         # Initialize the WignerD matrices and other values for spherical harmonic calculations
         for i in range(self.num_resolutions):
@@ -267,9 +307,8 @@ class EquiformerV2S_OC20_DenoisingPos(EquiformerV2Backbone):
         ###############################################################
 
         # Init per node representations using an atomic number based embedding
-        offset = 0
         x = SO3_Embedding(
-            num_atoms,
+            len(atomic_numbers),
             self.lmax_list,
             self.sphere_channels,
             self.device,
@@ -350,10 +389,10 @@ class EquiformerV2S_OC20_DenoisingPos(EquiformerV2Backbone):
             x.embedding[:, 0, :] = x.embedding[:, 0, :] + noise_schedule_sigma_enbedding
 
         # Edge encoding (distance and atom edge)
-        edge_distance = self.distance_expansion(edge_distance)
+        edge_distance = self.distance_expansion(graph.edge_distance)
         if self.share_atom_edge_embedding and self.use_atom_edge_embedding:
-            source_element = atomic_numbers[edge_index[0]]  # Source atom atomic number
-            target_element = atomic_numbers[edge_index[1]]  # Target atom atomic number
+            source_element = atomic_numbers[graph.edge_index[0]]  # Source atom atomic number
+            target_element = atomic_numbers[graph.edge_index[1]]  # Target atom atomic number
             source_embedding = self.source_embedding(source_element)
             target_embedding = self.target_embedding(target_element)
             edge_distance = torch.cat(
@@ -362,7 +401,11 @@ class EquiformerV2S_OC20_DenoisingPos(EquiformerV2Backbone):
 
         # Edge-degree embedding
         edge_degree = self.edge_degree_embedding(
-            atomic_numbers, edge_distance, edge_index
+            atomic_numbers,
+            edge_distance,
+            graph.edge_index,
+            len(atomic_numbers),
+            graph.node_offset,
         )
         x.embedding = x.embedding + edge_degree.embedding
 
@@ -375,8 +418,9 @@ class EquiformerV2S_OC20_DenoisingPos(EquiformerV2Backbone):
                 x,  # SO3_Embedding
                 atomic_numbers,
                 edge_distance,
-                edge_index,
+                graph.edge_index,
                 batch=data.batch,  # for GraphDropPath
+                node_offset=graph.node_offset,
             )
 
         # Final layer norm
@@ -417,22 +461,25 @@ class EquiformerV2S_OC20_DenoisingPos(EquiformerV2Backbone):
                 )
 
         # zero out denoising energy for ablation study
-        if hasattr(data, "denoising_pos_forward") and data.denoising_pos_forward:
-            if not self.use_denoising_energy:
-                energy = energy * 0.0
+        if (
+            hasattr(data, "denoising_pos_forward")
+            and data.denoising_pos_forward
+            and not self.use_denoising_energy
+        ):
+            energy = energy * 0.0
 
         outputs = {"energy": energy}
         ###############################################################
         # Force estimation
         ###############################################################
         if self.regress_forces:
-            forces = self.force_block(x, atomic_numbers, edge_distance, edge_index)
+            forces = self.force_block(x, atomic_numbers, edge_distance, graph.edge_index)
             forces = forces.embedding.narrow(1, 1, 3)
             forces = forces.view(-1, 3)
 
             # for denoising positions
             denoising_pos_vec = self.denoising_pos_block(
-                x, atomic_numbers, edge_distance, edge_index
+                x, atomic_numbers, edge_distance, graph.edge_index
             )
             denoising_pos_vec = denoising_pos_vec.embedding.narrow(1, 1, 3)
             denoising_pos_vec = denoising_pos_vec.view(-1, 3)
