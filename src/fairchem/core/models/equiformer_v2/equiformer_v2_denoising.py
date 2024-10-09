@@ -3,15 +3,15 @@ from __future__ import annotations
 import math
 
 import torch
-from ocpmodels.common.registry import registry
-from ocpmodels.common.utils import conditional_grad
+from fairchem.core.common.registry import registry
+from fairchem.core.common.utils import conditional_grad
 
 try:
     from e3nn import o3
 except ImportError:
     pass
 
-from .equiformer_v2 import EquiformerV2S_OC20
+from .equiformer_v2 import EquiformerV2Backbone
 from .so3 import SO3_Embedding, SO3_LinearV2
 from .transformer_block import (
     SO2EquivariantGraphAttention,
@@ -23,7 +23,7 @@ _AVG_DEGREE = 23.395238876342773  # IS2RE: 100k, max_radius = 5, max_neighbors =
 
 
 @registry.register_model("equiformer_v2_dens")
-class EquiformerV2S_OC20_DenoisingPos(EquiformerV2S_OC20):
+class EquiformerV2S_OC20_DenoisingPos(EquiformerV2Backbone):
     """
     Equiformer with graph attention built upon SO(2) convolution and feedforward network built upon S2 activation
 
@@ -57,7 +57,7 @@ class EquiformerV2S_OC20_DenoisingPos(EquiformerV2S_OC20):
         distance_function ("gaussian", "sigmoid", "linearsigmoid", "silu"):  Basis function used for distances
 
         attn_activation (str):      Type of activation function for SO(2) graph attention
-        use_tp_reparam (bool):      Whether to use tensor product re-parametrization for SO(2) convolution
+        use_tp_reparam (bool):      Whether to use tensor product re-parametrization for SO(2) convolution. #TODO: check if deprecated
         use_s2_act_attn (bool):     Whether to use attention after S2 activation. Otherwise, use the same attention as Equiformer
         use_attn_renorm (bool):     Whether to re-normalize attention weights
         ffn_activation (str):       Type of activation function for feedforward network
@@ -92,99 +92,97 @@ class EquiformerV2S_OC20_DenoisingPos(EquiformerV2S_OC20):
 
     def __init__(
         self,
-        num_atoms,  # not used
-        bond_feat_dim,  # not used
-        num_targets,  # not used
-        use_pbc=True,
-        regress_forces=True,
-        otf_graph=True,
-        max_neighbors=500,
-        max_radius=5.0,
-        max_num_elements=90,
-        num_layers=12,
-        sphere_channels=128,
-        attn_hidden_channels=128,
-        num_heads=8,
-        attn_alpha_channels=32,
-        attn_value_channels=16,
-        ffn_hidden_channels=512,
-        norm_type="rms_norm_sh",
-        lmax_list=[6],
-        mmax_list=[2],
-        grid_resolution=None,
-        num_sphere_samples=128,
-        edge_channels=128,
-        use_atom_edge_embedding=True,
-        share_atom_edge_embedding=False,
-        use_m_share_rad=False,
+        use_pbc: bool = True,
+        use_pbc_single: bool = False, #new
+        regress_forces: bool = True,
+        otf_graph: bool = True,
+        max_neighbors: int = 500,
+        max_radius: float = 5.0,
+        max_num_elements: int = 90,
+        num_layers: int = 12,
+        sphere_channels: int = 128,
+        attn_hidden_channels: int = 128,
+        num_heads: int = 8,
+        attn_alpha_channels: int = 32,
+        attn_value_channels: int = 16,
+        ffn_hidden_channels: int = 512,
+        norm_type: str = "rms_norm_sh",
+        lmax_list: list[int] | None = None,
+        mmax_list: list[int] | None = None,
+        grid_resolution: int | None = None,
+        num_sphere_samples: int = 128,
+        edge_channels: int = 128,
+        use_atom_edge_embedding: bool = True,
+        share_atom_edge_embedding: bool = False,
+        use_m_share_rad: bool = False,
         distance_function="gaussian",
-        num_distance_basis=512,
-        attn_activation="scaled_silu",
-        use_tp_reparam=False,
-        use_s2_act_attn=False,
-        use_attn_renorm=True,
+        num_distance_basis: int = 512,
+        attn_activation: str = "scaled_silu",
+        use_s2_act_attn: bool = False,
+        use_attn_renorm: bool = True,
         ffn_activation="scaled_silu",
-        use_gate_act=False,
-        use_grid_mlp=False,
-        use_sep_s2_act=True,
-        alpha_drop=0.1,
-        drop_path_rate=0.05,
-        proj_drop=0.0,
-        weight_init="normal",
-        avg_num_nodes=_AVG_NUM_NODES,
-        avg_degree=_AVG_DEGREE,
-        enforce_max_neighbors_strictly=True,
+        use_gate_act: bool = False,
+        use_grid_mlp: bool = False,
+        use_sep_s2_act: bool = True,
+        alpha_drop: float = 0.1,
+        drop_path_rate: float = 0.05,
+        proj_drop: float = 0.0,
+        weight_init: str = "normal",
+        enforce_max_neighbors_strictly: bool = True,
+        avg_num_nodes: float | None = None, # =_AVG_NUM_NODES,
+        avg_degree: float | None = None, # =_AVG_DEGREE,
+        use_energy_lin_ref: bool | None = False,
+        load_energy_lin_ref: bool | None = False,
+        activation_checkpoint: bool | None = False,
+        # following params are part of DeNS:
         use_force_encoding=True,
         use_noise_schedule_sigma_encoding=False,
         use_denoising_energy=True,
-        use_energy_lin_ref=False,
-        load_energy_lin_ref=False,
+        use_tp_reparam=False, # Not used, deprecated?
     ):
         super().__init__(
-            num_atoms,  # not used
-            bond_feat_dim,  # not used
-            num_targets,  # not used
-            use_pbc,
-            regress_forces,
-            otf_graph,
-            max_neighbors,
-            max_radius,
-            max_num_elements,
-            num_layers,
-            sphere_channels,
-            attn_hidden_channels,
-            num_heads,
-            attn_alpha_channels,
-            attn_value_channels,
-            ffn_hidden_channels,
-            norm_type,
-            lmax_list,
-            mmax_list,
-            grid_resolution,
-            num_sphere_samples,
-            edge_channels,
-            use_atom_edge_embedding,
-            share_atom_edge_embedding,
-            use_m_share_rad,
-            distance_function,
-            num_distance_basis,
-            attn_activation,
-            use_tp_reparam,
-            use_s2_act_attn,
-            use_attn_renorm,
-            ffn_activation,
-            use_gate_act,
-            use_grid_mlp,
-            use_sep_s2_act,
-            alpha_drop,
-            drop_path_rate,
-            proj_drop,
-            weight_init,
-            avg_num_nodes,
-            avg_degree,
-            enforce_max_neighbors_strictly,
-            use_energy_lin_ref,
-            load_energy_lin_ref,
+        use_pbc=use_pbc,
+        use_pbc_single=use_pbc_single,
+        regress_forces=regress_forces,
+        otf_graph=otf_graph,
+        max_neighbors=max_neighbors,
+        max_radius=max_radius,
+        max_num_elements=max_num_elements,
+        num_layers=num_layers,
+        sphere_channels=sphere_channels,
+        attn_hidden_channels=attn_hidden_channels,
+        num_heads=num_heads,
+        attn_alpha_channels=attn_alpha_channels,
+        attn_value_channels=attn_value_channels,
+        ffn_hidden_channels=ffn_hidden_channels,
+        norm_type=norm_type,
+        lmax_list=lmax_list,
+        mmax_list=mmax_list,
+        grid_resolution=grid_resolution,
+        num_sphere_samples=num_sphere_samples,
+        edge_channels=edge_channels,
+        use_atom_edge_embedding=use_atom_edge_embedding,
+        share_atom_edge_embedding=share_atom_edge_embedding,
+        use_m_share_rad=use_m_share_rad,
+        distance_function=distance_function,
+        num_distance_basis=num_distance_basis,
+        attn_activation=attn_activation,
+        use_s2_act_attn=use_s2_act_attn,
+        use_attn_renorm=use_attn_renorm,
+        ffn_activation=ffn_activation,
+        use_gate_act=use_gate_act,
+        use_grid_mlp=use_grid_mlp,
+        use_sep_s2_act=use_sep_s2_act,
+        alpha_drop=alpha_drop,
+        drop_path_rate=drop_path_rate,
+        proj_drop=proj_drop,
+        weight_init=weight_init,
+        enforce_max_neighbors_strictly=enforce_max_neighbors_strictly,
+        avg_num_nodes=avg_num_nodes,
+        avg_degree=avg_degree,
+        use_energy_lin_ref=use_energy_lin_ref,
+        load_energy_lin_ref=load_energy_lin_ref,
+        activation_checkpoint=activation_checkpoint
         )
 
         # for denoising position
@@ -221,7 +219,7 @@ class EquiformerV2S_OC20_DenoisingPos(EquiformerV2S_OC20):
                 self.block_use_atom_edge_embedding,
                 self.use_m_share_rad,
                 self.attn_activation,
-                self.use_tp_reparam,
+                # self.use_tp_reparam, deprecated?
                 self.use_s2_act_attn,
                 self.use_attn_renorm,
                 self.use_gate_act,
