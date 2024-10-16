@@ -87,7 +87,7 @@ class EquiformerV2S_OC20_DenoisingPos(EquiformerV2Backbone):
         distance_function ("gaussian", "sigmoid", "linearsigmoid", "silu"):  Basis function used for distances
 
         attn_activation (str):      Type of activation function for SO(2) graph attention
-        use_tp_reparam (bool):      Whether to use tensor product re-parametrization for SO(2) convolution. #TODO: check if deprecated
+        use_tp_reparam (bool):      Whether to use tensor product re-parametrization for SO(2) convolution. #TODO: check if deprecated or added
         use_s2_act_attn (bool):     Whether to use attention after S2 activation. Otherwise, use the same attention as Equiformer
         use_attn_renorm (bool):     Whether to re-normalize attention weights
         ffn_activation (str):       Type of activation function for feedforward network
@@ -264,30 +264,36 @@ class EquiformerV2S_OC20_DenoisingPos(EquiformerV2Backbone):
         self.batch_size = len(data.natoms)
         self.dtype = data.pos.dtype
         self.device = data.pos.device
-
         atomic_numbers = data.atomic_numbers.long()
         num_atoms = len(atomic_numbers)
-
-
-        # (
-        #     atomic_numbers_full,
-        #     batch_full,
-        #     cell_offsets,
-        #     edge_distance,
-        #     edge_distance_vec,
-        #     edge_index,
-        #     neighbors,
-        #     node_offset,
-        #     offset_distances,
-        # )= self.generate_graph(
-        #     data,
-        #     enforce_max_neighbors_strictly=self.enforce_max_neighbors_strictly,
-        # )
+        assert (
+            atomic_numbers.max().item() < self.max_num_elements
+        ), "Atomic number exceeds that given in model config"
         graph = self.generate_graph(
             data,
             enforce_max_neighbors_strictly=self.enforce_max_neighbors_strictly,
         )
 
+        data_batch = data.batch
+        if gp_utils.initialized():
+            (
+                atomic_numbers,
+                data_batch,
+                node_offset,
+                edge_index,
+                edge_distance,
+                edge_distance_vec,
+            ) = self._init_gp_partitions(
+                graph.atomic_numbers_full,
+                graph.batch_full,
+                graph.edge_index,
+                graph.edge_distance,
+                graph.edge_distance_vec,
+            )
+            graph.node_offset = node_offset
+            graph.edge_index = edge_index
+            graph.edge_distance = edge_distance
+            graph.edge_distance_vec = edge_distance_vec
 
         ###############################################################
         # Initialize data structures
@@ -389,20 +395,24 @@ class EquiformerV2S_OC20_DenoisingPos(EquiformerV2Backbone):
             x.embedding[:, 0, :] = x.embedding[:, 0, :] + noise_schedule_sigma_enbedding
 
         # Edge encoding (distance and atom edge)
-        edge_distance = self.distance_expansion(graph.edge_distance)
+        graph.edge_distance = self.distance_expansion(graph.edge_distance)
         if self.share_atom_edge_embedding and self.use_atom_edge_embedding:
-            source_element = atomic_numbers[graph.edge_index[0]]  # Source atom atomic number
-            target_element = atomic_numbers[graph.edge_index[1]]  # Target atom atomic number
+            source_element = graph.atomic_numbers_full[
+                graph.edge_index[0]
+            ]  # Source atom atomic number
+            target_element = graph.atomic_numbers_full[
+                graph.edge_index[1]
+            ]  # Target atom atomic number
             source_embedding = self.source_embedding(source_element)
             target_embedding = self.target_embedding(target_element)
-            edge_distance = torch.cat(
-                (edge_distance, source_embedding, target_embedding), dim=1
+            graph.edge_distance = torch.cat(
+                (graph.edge_distance, source_embedding, target_embedding), dim=1
             )
 
         # Edge-degree embedding
         edge_degree = self.edge_degree_embedding(
-            atomic_numbers,
-            edge_distance,
+            graph.atomic_numbers_full,
+            graph.edge_distance,
             graph.edge_index,
             len(atomic_numbers),
             graph.node_offset,
@@ -414,14 +424,26 @@ class EquiformerV2S_OC20_DenoisingPos(EquiformerV2Backbone):
         ###############################################################
 
         for i in range(self.num_layers):
-            x = self.blocks[i](
-                x,  # SO3_Embedding
-                atomic_numbers,
-                edge_distance,
-                graph.edge_index,
-                batch=data.batch,  # for GraphDropPath
-                node_offset=graph.node_offset,
-            )
+            if self.activation_checkpoint:
+                x = torch.utils.checkpoint.checkpoint(
+                    self.blocks[i],
+                    x,  # SO3_Embedding
+                    graph.atomic_numbers_full,
+                    graph.edge_distance,
+                    graph.edge_index,
+                    data_batch,  # for GraphDropPath
+                    graph.node_offset,
+                    use_reentrant=not self.training,
+                )
+            else:
+                x = self.blocks[i](
+                    x,  # SO3_Embedding
+                    graph.atomic_numbers_full,
+                    graph.edge_distance,
+                    graph.edge_index,
+                    batch=data_batch,  # for GraphDropPath
+                    node_offset=graph.node_offset,
+                )
 
         # Final layer norm
         x.embedding = self.norm(x.embedding)
@@ -473,7 +495,12 @@ class EquiformerV2S_OC20_DenoisingPos(EquiformerV2Backbone):
         # Force estimation
         ###############################################################
         if self.regress_forces:
-            forces = self.force_block(x, atomic_numbers, edge_distance, graph.edge_index)
+            forces = self.force_block(
+                x,
+                atomic_numbers,
+                edge_distance,
+                graph.edge_index
+            )
             forces = forces.embedding.narrow(1, 1, 3)
             forces = forces.view(-1, 3)
 
