@@ -59,6 +59,7 @@ class EquiformerV2S_OC20_DenoisingPos(EquiformerV2Backbone):
 
     Args:
         use_pbc (bool):         Use periodic boundary conditions
+        use_pbc_single (bool):         Process batch PBC graphs one at a time
         regress_forces (bool):  Compute forces
         otf_graph (bool):       Compute graph On The Fly (OTF)
         max_neighbors (int):    Maximum number of neighbors per atom
@@ -87,7 +88,6 @@ class EquiformerV2S_OC20_DenoisingPos(EquiformerV2Backbone):
         distance_function ("gaussian", "sigmoid", "linearsigmoid", "silu"):  Basis function used for distances
 
         attn_activation (str):      Type of activation function for SO(2) graph attention
-        use_tp_reparam (bool):      Whether to use tensor product re-parametrization for SO(2) convolution. #TODO: check if deprecated or added
         use_s2_act_attn (bool):     Whether to use attention after S2 activation. Otherwise, use the same attention as Equiformer
         use_attn_renorm (bool):     Whether to re-normalize attention weights
         ffn_activation (str):       Type of activation function for feedforward network
@@ -100,12 +100,9 @@ class EquiformerV2S_OC20_DenoisingPos(EquiformerV2Backbone):
         proj_drop (float):          Dropout rate for outputs of attention and FFN in Transformer blocks
 
         weight_init (str):          ['normal', 'uniform'] initialization of weights of linear layers except those in radial functions
-
+        enforce_max_neighbors_strictly (bool):      When edges are subselected based on the `max_neighbors` arg, arbitrarily select amongst equidistant / degenerate edges to have exactly the correct number.
         avg_num_nodes (float):      Normalization factor for sum aggregation over nodes
         avg_degree (float):         Normalization factor for sum aggregation over edges
-
-        enforce_max_neighbors_strictly (bool):      When edges are subselected based on the `max_neighbors` arg, arbitrarily select amongst equidistant / degenerate edges to have exactly the correct number.
-
         use_force_encoding (bool):                  For ablation study, whether to encode forces during denoising positions. Default: True.
         use_noise_schedule_sigma_encoding (bool):   For ablation study, whether to encode the sigma (sampled std of Gaussian noises) during
                                                     denoising positions when `fixed_noise_std` = False in config files. Default: False.
@@ -231,31 +228,6 @@ class EquiformerV2S_OC20_DenoisingPos(EquiformerV2Backbone):
                 in_features=1, out_features=self.sphere_channels
             )
 
-        if self.regress_forces:
-            self.denoising_pos_block = SO2EquivariantGraphAttention(
-                self.sphere_channels,
-                self.attn_hidden_channels,
-                self.num_heads,
-                self.attn_alpha_channels,
-                self.attn_value_channels,
-                1,
-                self.lmax_list,
-                self.mmax_list,
-                self.SO3_rotation,
-                self.mappingReduced,
-                self.SO3_grid,
-                self.max_num_elements,
-                self.edge_channels_list,
-                self.block_use_atom_edge_embedding,
-                self.use_m_share_rad,
-                self.attn_activation,
-                # self.use_tp_reparam, deprecated?
-                self.use_s2_act_attn,
-                self.use_attn_renorm,
-                self.use_gate_act,
-                self.use_sep_s2_act,
-                alpha_drop=0.0,
-            )
 
         self.apply(partial(eqv2_init_weights, weight_init=self.weight_init))
 
@@ -265,7 +237,6 @@ class EquiformerV2S_OC20_DenoisingPos(EquiformerV2Backbone):
         self.dtype = data.pos.dtype
         self.device = data.pos.device
         atomic_numbers = data.atomic_numbers.long()
-        num_atoms = len(atomic_numbers)
         assert (
             atomic_numbers.max().item() < self.max_num_elements
         ), "Atomic number exceeds that given in model config"
@@ -294,6 +265,18 @@ class EquiformerV2S_OC20_DenoisingPos(EquiformerV2Backbone):
             graph.edge_index = edge_index
             graph.edge_distance = edge_distance
             graph.edge_distance_vec = edge_distance_vec
+
+        ###############################################################
+        # Entering Graph Parallel Region
+        # after this point, if using gp, then node, edge tensors are split
+        # across the graph parallel ranks, some full tensors such as
+        # atomic_numbers_full are required because we need to index into the
+        # full graph when computing edge embeddings or reducing nodes from neighbors
+        #
+        # all tensors that do not have the suffix "_full" refer to the partial tensors.
+        # if not using gp, the full values are equal to the partial values
+        # ie: atomic_numbers_full == atomic_numbers
+        ###############################################################
 
         ###############################################################
         # Initialize data structures
@@ -334,7 +317,9 @@ class EquiformerV2S_OC20_DenoisingPos(EquiformerV2Backbone):
             offset = offset + self.sphere_channels
             offset_res = offset_res + int((self.lmax_list[i] + 1) ** 2)
 
+        #-------------------------DeNS-Section-Begin---------------------------
         # Node-wise force encoding during denoising positions
+        num_atoms = len(graph.atomic_numbers_full)
         force_embedding = SO3_Embedding(
             num_atoms, self.lmax_list, 1, self.device, self.dtype
         )
@@ -393,6 +378,7 @@ class EquiformerV2S_OC20_DenoisingPos(EquiformerV2Backbone):
                 )
             noise_schedule_sigma_enbedding = self.noise_schedule_sigma_embedding(sigmas)
             x.embedding[:, 0, :] = x.embedding[:, 0, :] + noise_schedule_sigma_enbedding
+        #-------------------------DeNS-Section-End-----------------------------
 
         # Edge encoding (distance and atom edge)
         graph.edge_distance = self.distance_expansion(graph.edge_distance)
@@ -448,40 +434,60 @@ class EquiformerV2S_OC20_DenoisingPos(EquiformerV2Backbone):
         # Final layer norm
         x.embedding = self.norm(x.embedding)
 
-        ###############################################################
-        # Energy estimation
-        ###############################################################
-        node_energy = self.energy_block(x)
-        node_energy = node_energy.embedding.narrow(1, 0, 1)
-        energy = torch.zeros(
-            len(data.natoms), device=node_energy.device, dtype=node_energy.dtype
+        return {"node_embedding": x, "graph": graph}
+
+@registry.register_model("equiformer_v2_energy_head_denoising")
+class EquiformerV2EnergyHeadDenoising(nn.Module, HeadInterface):
+    def __init__(self, backbone, reduce: str = "sum"):
+        super().__init__()
+        self.reduce = reduce
+        self.avg_num_nodes = backbone.avg_num_nodes
+        self.energy_block = FeedForwardNetwork(
+            backbone.sphere_channels,
+            backbone.ffn_hidden_channels,
+            1,
+            backbone.lmax_list,
+            backbone.mmax_list,
+            backbone.SO3_grid,
+            backbone.ffn_activation,
+            backbone.use_gate_act,
+            backbone.use_grid_mlp,
+            backbone.use_sep_s2_act,
         )
+        # for denoisng energy
+        self.use_denoising_energy = backbone.use_denoising_energy
+        self.apply(partial(eqv2_init_weights, weight_init=backbone.weight_init))
+
+    def forward(self, data: Batch, emb: dict[str, torch.Tensor | GraphData]):
+        node_energy = self.energy_block(emb["node_embedding"])
+        node_energy = node_energy.embedding.narrow(1, 0, 1)
+        if gp_utils.initialized(): #TODO: Check why gp_utils was removed
+            node_energy = gp_utils.gather_from_model_parallel_region(node_energy, dim=0)
+        energy = torch.zeros(
+            len(data.natoms),
+            device=node_energy.device,
+            dtype=node_energy.dtype,
+        )
+
         energy.index_add_(0, data.batch, node_energy.view(-1))
-        energy = energy / self.avg_num_nodes
+        if self.reduce == "sum":
+            energy = energy / self.avg_num_nodes
+        elif self.reduce == "mean":
+            energy = energy / data.natoms
+        else:
+            raise ValueError(
+                f"reduce can only be sum or mean, user provided: {self.reduce}"
+            )
 
         # Add the per-atom linear references to the energy.
-        if self.use_energy_lin_ref and self.load_energy_lin_ref:
-            # During training, target E = (E_DFT - E_ref - E_mean) / E_std, and
-            # during inference, \hat{E_DFT} = \hat{E} * E_std + E_ref + E_mean
-            # where
-            #
-            # E_DFT = raw DFT energy,
-            # E_ref = reference energy,
-            # E_mean = normalizer mean,
-            # E_std = normalizer std,
-            # \hat{E} = predicted energy,
-            # \hat{E_DFT} = predicted DFT energy.
-            #
-            # We can also write this as
-            # \hat{E_DFT} = E_std * (\hat{E} + E_ref / E_std) + E_mean,
-            # which is why we save E_ref / E_std as the linear reference.
-            with torch.cuda.amp.autocast(False):
-                energy = energy.to(self.energy_lin_ref.dtype).index_add(
-                    0,
-                    data.batch,
-                    self.energy_lin_ref[atomic_numbers],
-                )
-
+        # if self.use_energy_lin_ref and self.load_energy_lin_ref: #TODO: Check if use_energy_lin_ref is deprecated
+        #     with torch.cuda.amp.autocast(False):
+        #         energy = energy.to(self.energy_lin_ref.dtype).index_add(
+        #             0,
+        #             data.batch,
+        #             self.energy_lin_ref[emb["graph"].atomic_numbers_full,],
+        #         )
+        #------------for denoising positions------------------
         # zero out denoising energy for ablation study
         if (
             hasattr(data, "denoising_pos_forward")
@@ -489,40 +495,110 @@ class EquiformerV2S_OC20_DenoisingPos(EquiformerV2Backbone):
             and not self.use_denoising_energy
         ):
             energy = energy * 0.0
+        #------------for denoising positions------------------
+        return {"energy": energy}
 
-        outputs = {"energy": energy}
-        ###############################################################
-        # Force estimation
-        ###############################################################
-        if self.regress_forces:
+@registry.register_model("equiformer_v2_force_head_denoising")
+class EquiformerV2ForceHeadDenoising(nn.Module, HeadInterface):
+    def __init__(self, backbone):
+        super().__init__()
+
+        self.activation_checkpoint = backbone.activation_checkpoint
+        self.force_block = SO2EquivariantGraphAttention(
+            backbone.sphere_channels,
+            backbone.attn_hidden_channels,
+            backbone.num_heads,
+            backbone.attn_alpha_channels,
+            backbone.attn_value_channels,
+            1,
+            backbone.lmax_list,
+            backbone.mmax_list,
+            backbone.SO3_rotation,
+            backbone.mappingReduced,
+            backbone.SO3_grid,
+            backbone.max_num_elements,
+            backbone.edge_channels_list,
+            backbone.block_use_atom_edge_embedding,
+            backbone.use_m_share_rad,
+            backbone.attn_activation,
+            backbone.use_s2_act_attn,
+            backbone.use_attn_renorm,
+            backbone.use_gate_act,
+            backbone.use_sep_s2_act,
+            alpha_drop=0.0,
+        )
+
+        self.denoising_pos_block = SO2EquivariantGraphAttention(
+            backbone.sphere_channels,
+            backbone.attn_hidden_channels,
+            backbone.num_heads,
+            backbone.attn_alpha_channels,
+            backbone.attn_value_channels,
+            1,
+            backbone.lmax_list,
+            backbone.mmax_list,
+            backbone.SO3_rotation,
+            backbone.mappingReduced,
+            backbone.SO3_grid,
+            backbone.max_num_elements,
+            backbone.edge_channels_list,
+            backbone.block_use_atom_edge_embedding,
+            backbone.use_m_share_rad,
+            backbone.attn_activation,
+            backbone.use_s2_act_attn,
+            backbone.use_attn_renorm,
+            backbone.use_gate_act,
+            backbone.use_sep_s2_act,
+            alpha_drop=0.0,
+        )
+
+        self.apply(partial(eqv2_init_weights, weight_init=backbone.weight_init))
+
+    def forward(self, data: Batch, emb: dict[str, torch.Tensor]):
+        if self.activation_checkpoint:
+            forces = torch.utils.checkpoint.checkpoint(
+                self.force_block,
+                emb["node_embedding"],
+                emb["graph"].atomic_numbers_full,
+                emb["graph"].edge_distance,
+                emb["graph"].edge_index,
+                emb["graph"].node_offset,
+                use_reentrant=not self.training,
+            )
+        else:
             forces = self.force_block(
-                x,
-                atomic_numbers,
-                edge_distance,
-                graph.edge_index
+                emb["node_embedding"],
+                emb["graph"].atomic_numbers_full,
+                emb["graph"].edge_distance,
+                emb["graph"].edge_index,
+                node_offset=emb["graph"].node_offset,
             )
-            forces = forces.embedding.narrow(1, 1, 3)
-            forces = forces.view(-1, 3)
+        forces = forces.embedding.narrow(1, 1, 3)
+        #TODO: Check if contiguous is required prev version did not have it
+        forces = forces.view(-1, 3).contiguous()
+        if gp_utils.initialized(): # TODO: Check why gp_utils was removed
+            forces = gp_utils.gather_from_model_parallel_region(forces, dim=0)
 
-            # for denoising positions
-            denoising_pos_vec = self.denoising_pos_block(
-                x, atomic_numbers, edge_distance, graph.edge_index
-            )
-            denoising_pos_vec = denoising_pos_vec.embedding.narrow(1, 1, 3)
-            denoising_pos_vec = denoising_pos_vec.view(-1, 3)
+        #------------for denoising positions------------------
+        denoising_pos_vec = self.denoising_pos_block(
+            emb["node_embedding"],
+            emb["graph"].atomic_numbers_full,
+            emb["graph"].edge_distance,
+            emb["graph"].edge_index,
+        )
+        denoising_pos_vec = denoising_pos_vec.embedding.narrow(1, 1, 3)
+        denoising_pos_vec = denoising_pos_vec.view(-1, 3)
 
-        if self.regress_forces:
-            if hasattr(data, "denoising_pos_forward") and data.denoising_pos_forward:
-                if hasattr(data, "noise_mask"):
-                    noise_mask_tensor = data.noise_mask.view(-1, 1)
-                    forces = denoising_pos_vec * noise_mask_tensor + forces * (
-                        ~noise_mask_tensor
-                    )
-                else:
-                    forces = denoising_pos_vec + 0 * forces
+        if hasattr(data, "denoising_pos_forward") and data.denoising_pos_forward:
+            if hasattr(data, "noise_mask"):
+                noise_mask_tensor = data.noise_mask.view(-1, 1)
+                forces = denoising_pos_vec * noise_mask_tensor + forces * (
+                    ~noise_mask_tensor
+                )
             else:
-                forces = 0 * denoising_pos_vec + forces
+                forces = denoising_pos_vec + 0 * forces
+        else:
+            forces = 0 * denoising_pos_vec + forces
+        #-------------for denoising positions------------------
 
-            outputs["forces"] = forces
-
-        return outputs
+        return {"forces": forces}
