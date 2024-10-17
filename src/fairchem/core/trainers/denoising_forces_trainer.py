@@ -1,15 +1,17 @@
 """
-Copyright (c) Facebook, Inc. and its affiliates.
+Copyright (c) Meta, Inc. and its affiliates.
 
 This source code is licensed under the MIT license found in the
 LICENSE file in the root directory of this source tree.
 """
-# ruff: noqa: E501
+
 from __future__ import annotations
 
 import logging
+import os
 from collections import defaultdict
 from dataclasses import dataclass
+from itertools import chain
 from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
@@ -19,12 +21,17 @@ from tqdm import tqdm
 
 from fairchem.core.common import distutils
 from fairchem.core.common.registry import registry
+from fairchem.core.common.relaxation.ml_relaxation import ml_relax
+from fairchem.core.common.utils import cg_change_mat, check_traj_files, irreps_sum
 from fairchem.core.models.equiformer_v2.trainers.forces_trainer import (
     EquiformerV2ForcesTrainer,
 )
-from fairchem.core.modules.evaluator import mae
+from fairchem.core.modules.evaluator import mae, Evaluator
 from fairchem.core.modules.normalization.normalizer import Normalizer, create_normalizer
 from fairchem.core.modules.scaling.util import ensure_fitted
+
+if TYPE_CHECKING:
+    from torch_geometric.data import Batch
 
 
 @dataclass
@@ -229,8 +236,11 @@ class DenoisingForcesTrainer(EquiformerV2ForcesTrainer):
     Args:
         task (dict): Task configuration.
         model (dict): Model configuration.
+        outputs (dict): Output property configuration.
         dataset (dict): Dataset configuration. The dataset needs to be a SinglePointLMDB dataset.
         optimizer (dict): Optimizer configuration.
+        loss_functions (dict): Loss function configuration.
+        evaluation_metrics (dict): Evaluation metrics configuration.
         identifier (str): Experiment identifier that is appended to log directory.
         run_dir (str, optional): Path to the run directory where logs are to be saved.
             (default: :obj:`None`)
@@ -243,9 +253,7 @@ class DenoisingForcesTrainer(EquiformerV2ForcesTrainer):
         seed (int, optional): Random number seed.
             (default: :obj:`None`)
         logger (str, optional): Type of logger to be used.
-            (default: :obj:`tensorboard`)
-        local_rank (int, optional): Local rank of the process, only applicable for distributed training.
-            (default: :obj:`0`)
+            (default: :obj:`wandb`)
         amp (bool, optional): Run using automatic mixed precision.
             (default: :obj:`False`)
         slurm (dict): Slurm configuration. Currently just for keeping track.
@@ -332,7 +340,7 @@ class DenoisingForcesTrainer(EquiformerV2ForcesTrainer):
             ),
         )
 
-    def train(self, disable_eval_tqdm=False):
+    def train(self, disable_eval_tqdm: bool = False) -> None:
         ensure_fitted(self._unwrapped_model, warn=True)
 
         eval_every = self.config["optim"].get("eval_every", len(self.train_loader))
@@ -418,7 +426,7 @@ class DenoisingForcesTrainer(EquiformerV2ForcesTrainer):
                     or i == 0
                     or i == (len(self.train_loader) - 1)
                 ) and distutils.is_master():
-                    log_str = ["{}: {:.2e}".format(k, v) for k, v in log_dict.items()]
+                    log_str = [f"{k}: {v:.2e}" for k, v in log_dict.items()]
                     logging.info(", ".join(log_str))
                     self.metrics = {}
 
@@ -442,7 +450,8 @@ class DenoisingForcesTrainer(EquiformerV2ForcesTrainer):
                             )
 
                         val_metrics = self.validate(
-                            split="val", disable_tqdm=disable_eval_tqdm
+                            split="val",
+                            disable_tqdm=disable_eval_tqdm,
                         )
                         self.update_best(
                             primary_metric,
@@ -466,7 +475,7 @@ class DenoisingForcesTrainer(EquiformerV2ForcesTrainer):
                 else:
                     self.scheduler.step()
 
-            # torch.cuda.empty_cache()
+            torch.cuda.empty_cache() #TODO: check if commenting this out was correct
 
             if checkpoint_every == -1:
                 self.save(checkpoint_file="checkpoint.pt", training_state=True)
@@ -477,13 +486,25 @@ class DenoisingForcesTrainer(EquiformerV2ForcesTrainer):
         if self.config.get("test_dataset", False):
             self.test_dataset.close_db()
 
-    def _compute_loss(self, out, batch):
+    def _denorm_preds(self, target_key: str, prediction: torch.Tensor, batch: Batch):
+        """Convert model output from a batch into raw prediction by denormalizing and adding references"""
+        # denorm the outputs
+        if target_key in self.normalizers:
+            prediction = self.normalizers[target_key](prediction)
+
+        # add element references
+        if target_key in self.elementrefs:
+            prediction = self.elementrefs[target_key](prediction, batch)
+
+        return prediction
+
+    def _compute_loss(self, out, batch) -> torch.Tensor:
         batch_size = batch.natoms.numel()
         fixed = batch.fixed
         mask = fixed == 0
 
         loss = []
-        for loss_fn in self.loss_fns:
+        for loss_fn in self.loss_functions:
             target_name, loss_info = loss_fn
 
             if target_name == "forces" and batch.get("denoising_pos_forward", False):
@@ -577,6 +598,7 @@ class DenoisingForcesTrainer(EquiformerV2ForcesTrainer):
             else:
                 target = batch[target_name]
                 pred = out[target_name]
+
                 natoms = batch.natoms
                 natoms = torch.repeat_interleave(natoms, natoms)
 
@@ -613,8 +635,7 @@ class DenoisingForcesTrainer(EquiformerV2ForcesTrainer):
         for lc in loss:
             assert hasattr(lc, "grad_fn")
 
-        loss = sum(loss)
-        return loss
+        return sum(loss)
 
     def _compute_metrics(self, out, batch, evaluator, metrics={}):
         # This assumes batch.fixed is specified correctly for each dataset.
@@ -706,16 +727,13 @@ class DenoisingForcesTrainer(EquiformerV2ForcesTrainer):
                 else:
                     target = target.view(batch_size, -1)
 
+                out[target_name] = self._denorm_preds(target_name, out[target_name], batch)
                 targets[target_name] = target
-                if self.normalizers.get(target_name, False):
-                    out[target_name] = self.normalizers[target_name].denorm(
-                        out[target_name]
-                    )
 
         targets["natoms"] = natoms
         out["natoms"] = natoms
 
-        metrics = denoising_pos_eval(
+        return denoising_pos_eval(
             evaluator,
             out,
             targets,
@@ -723,14 +741,13 @@ class DenoisingForcesTrainer(EquiformerV2ForcesTrainer):
             denoising_pos_forward=denoising_pos_forward,
         )
 
-        return metrics
-
+    # Takes in a new data source and generates predictions on it.
     @torch.no_grad()
     def predict(
         self,
         data_loader,
         per_image: bool = True,
-        results_file: Optional[str] = None,
+        results_file: str | None = None,
         disable_tqdm: bool = False,
     ):
         if self.is_debug and per_image:
@@ -762,11 +779,11 @@ class DenoisingForcesTrainer(EquiformerV2ForcesTrainer):
         for key in self.normalizers.keys():
             self.normalizers[key].to(self.device)
 
-        for i, batch in tqdm(
+        for _, batch in tqdm(
             enumerate(data_loader),
             total=len(data_loader),
             position=rank,
-            desc="device {}".format(rank),
+            desc=f"device {rank}",
             disable=disable_tqdm,
         ):
             with torch.cuda.amp.autocast(enabled=self.scaler is not None):
@@ -777,9 +794,7 @@ class DenoisingForcesTrainer(EquiformerV2ForcesTrainer):
                 out[key] = out[key].float()
 
             for target_key in self.config["outputs"]:
-                pred = out[target_key]
-                if self.normalizers.get(target_key, False):
-                    pred = self.normalizers[target_key].denorm(pred)
+                pred = self._denorm_preds(target_key, out[target_key], batch)
 
                 if per_image:
                     ### Save outputs in desired precision, default float16
@@ -852,11 +867,6 @@ class DenoisingForcesTrainer(EquiformerV2ForcesTrainer):
 
             predictions["ids"].extend(systemids)
 
-        # for key in predictions:
-            # if isinstance(predictions[key][0], np.ndarray):
-                # predictions[key] = np.concatenate(predictions[key], axis=0)
-            # else:
-                # predictions[key] = np.array(predictions[key])
         self.save_results(predictions, results_file)
 
         if self.ema:
