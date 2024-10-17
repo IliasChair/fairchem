@@ -165,7 +165,7 @@ class EquiformerV2S_OC20_DenoisingPos(EquiformerV2Backbone):
         use_force_encoding=True,
         use_noise_schedule_sigma_encoding=False,
         use_denoising_energy=True,
-        use_tp_reparam=False, # Not used, deprecated?
+        use_tp_reparam=False, #TODO: Not used, check if it is deprecated
     ):
         super().__init__(
         use_pbc=use_pbc,
@@ -227,7 +227,6 @@ class EquiformerV2S_OC20_DenoisingPos(EquiformerV2Backbone):
             self.noise_schedule_sigma_embedding = torch.nn.Linear(
                 in_features=1, out_features=self.sphere_channels
             )
-
 
         self.apply(partial(eqv2_init_weights, weight_init=self.weight_init))
 
