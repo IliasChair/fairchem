@@ -157,7 +157,7 @@ def add_gaussian_noise_schedule_to_position(
 
 
 def denoising_pos_eval(
-    evaluator, prediction, target, prev_metrics={}, denoising_pos_forward=False
+    evaluator, prediction, target, prev_metrics=None, denoising_pos_forward=False
 ):
     """
     1.  Overwrite the original Evaluator.eval() here: https://github.com/Open-Catalyst-Project/ocp/blob/5a7738f9aa80b1a9a7e0ca15e33938b4d2557edd/ocpmodels/modules/evaluator.py#L69-L81
@@ -167,23 +167,22 @@ def denoising_pos_eval(
     if not denoising_pos_forward:
         return evaluator.eval(prediction, target, prev_metrics)
 
-    # for attr in evaluator.task_attributes[evaluator.task]:
-    #     assert attr in prediction
-    #     assert attr in target
-    #     assert prediction[attr].shape == target[attr].shape
-
     metrics = prev_metrics
 
     if target.get("noise_mask", None) is None:
         # Only update `denoising_energy_mae` and `denoising_pos_mae` during denoising positions if not using partially corrupted structures
-        res = eval("mae")(prediction, target, "energy")
+        res = mae(prediction, target, "energy")
         metrics = evaluator.update("denoising_energy_mae", res, metrics)
-        res = eval("mae")(prediction, target, "forces")
+        res = mae(prediction, target, "forces")
         metrics = evaluator.update("denoising_pos_mae", res, metrics)
+        res = mae(prediction, target, "stress")
+        metrics = evaluator.update("denoising_stress_mae", res, metrics)
     else:
         # Update `denoising_energy_mae`, `denoising_pos_mae` and `denoising_force_mae` if using partially corrupted structures
-        res = eval("mae")(prediction, target, "energy")
+        res = mae(prediction, target, "energy")
         metrics = evaluator.update("denoising_energy_mae", res, metrics)
+        res = mae(prediction, target, "stress")
+        metrics = evaluator.update("denoising_stress_mae", res, metrics)
         # separate S2EF and denoising positions results based on `noise_mask`
         target_tensor = target["forces"]
         prediction_tensor = prediction["forces"]
@@ -191,13 +190,13 @@ def denoising_pos_eval(
         s2ef_index = torch.where(noise_mask == 0)
         s2ef_prediction = {"forces": prediction_tensor[s2ef_index]}
         s2ef_target = {"forces": target_tensor[s2ef_index]}
-        res = eval("mae")(s2ef_prediction, s2ef_target, "forces")
+        res = mae(s2ef_prediction, s2ef_target, "forces")
         if res["numel"] != 0:
             metrics = evaluator.update("denoising_force_mae", res, metrics)
         denoising_pos_index = torch.where(noise_mask == 1)
         denoising_pos_prediction = {"forces": prediction_tensor[denoising_pos_index]}
         denoising_pos_target = {"forces": target_tensor[denoising_pos_index]}
-        res = eval("mae")(denoising_pos_prediction, denoising_pos_target, "forces")
+        res = mae(denoising_pos_prediction, denoising_pos_target, "forces")
         if res["numel"] != 0:
             metrics = evaluator.update("denoising_pos_mae", res, metrics)
     return metrics
@@ -215,8 +214,7 @@ def compute_atomwise_denoising_pos_and_force_hybrid_loss(
     loss = loss * mult_tensor
     if mask is not None:
         loss = loss[mask]
-    loss = torch.mean(loss)
-    return loss
+    return torch.mean(loss)
 
 
 @registry.register_trainer("denoising_forces")
@@ -254,6 +252,8 @@ class DenoisingForcesTrainer(EquiformerV2ForcesTrainer):
             (default: :obj:`None`)
         logger (str, optional): Type of logger to be used.
             (default: :obj:`wandb`)
+        local_rank (int, optional): Local rank of the process, only applicable for distributed training.
+            (default: :obj:`0`)
         amp (bool, optional): Run using automatic mixed precision.
             (default: :obj:`False`)
         slurm (dict): Slurm configuration. Currently just for keeping track.
@@ -270,20 +270,17 @@ class DenoisingForcesTrainer(EquiformerV2ForcesTrainer):
         loss_functions: dict[str, str | float],
         evaluation_metrics: dict[str, str],
         identifier: str,
-        # TODO: dealing with local rank is dangerous
-        # T201111838 remove this and use CUDA_VISIBILE_DEVICES instead so trainers don't need to know about which devie to use
-        local_rank: int,
         timestamp_id: str | None = None,
         run_dir: str | None = None,
         is_debug: bool = False,
         print_every: int = 100,
         seed: int | None = None,
         logger: str = "wandb",
+        local_rank: int = 0,
         amp: bool = False,
         cpu: bool = False,
         name: str = "ocp",
         slurm=None,
-        # following not used in DeNS
         gp_gpus: int | None = None,
         inference_only: bool = False,
     ):
@@ -322,15 +319,6 @@ class DenoisingForcesTrainer(EquiformerV2ForcesTrainer):
         self.denoising_pos_params.denoising_pos_coefficient = self.config["optim"][
             "denoising_pos_coefficient"
         ]
-        # self.normalizers["denoising_pos_target"] = Normalizer(
-        #     mean=0.0,
-        #     std=(
-        #         self.denoising_pos_params.std
-        #         if self.denoising_pos_params.fixed_noise_std
-        #         else self.denoising_pos_params.std_high
-        #     ),
-        #     device=self.device,
-        # )
         self.normalizers["denoising_pos_target"] = create_normalizer(
             mean=0.0,
             stdev=(
@@ -363,8 +351,6 @@ class DenoisingForcesTrainer(EquiformerV2ForcesTrainer):
             self.train_sampler.set_epoch_and_start_iteration(epoch_int, skip_steps)
             train_loader_iter = iter(self.train_loader)
 
-            self.metrics = {}
-
             for i in range(skip_steps, len(self.train_loader)):
                 self.epoch = epoch_int + (i + 1) / len(self.train_loader)
                 self.step = epoch_int * len(self.train_loader) + i + 1
@@ -374,32 +360,31 @@ class DenoisingForcesTrainer(EquiformerV2ForcesTrainer):
                 batch = next(train_loader_iter)
 
                 # for denoising positions
-                if self.use_denoising_pos:
-                    if np.random.rand() < self.denoising_pos_params.prob:
-                        if self.denoising_pos_params.fixed_noise_std:
-                            batch = add_gaussian_noise_to_position(
-                                batch,
-                                std=self.denoising_pos_params.std,
-                                corrupt_ratio=self.denoising_pos_params.corrupt_ratio,
-                                all_atoms=self.denoising_pos_params.all_atoms,
-                            )
-                        else:
-                            batch = add_gaussian_noise_schedule_to_position(
-                                batch,
-                                std_low=self.denoising_pos_params.std_low,
-                                std_high=self.denoising_pos_params.std_high,
-                                num_steps=self.denoising_pos_params.num_steps,
-                                corrupt_ratio=self.denoising_pos_params.corrupt_ratio,
-                                all_atoms=self.denoising_pos_params.all_atoms,
-                            )
+                if (
+                    self.use_denoising_pos
+                    and np.random.rand() < self.denoising_pos_params.prob
+                ):
+                    if self.denoising_pos_params.fixed_noise_std:
+                        batch = add_gaussian_noise_to_position(
+                            batch,
+                            std=self.denoising_pos_params.std,
+                            corrupt_ratio=self.denoising_pos_params.corrupt_ratio,
+                            all_atoms=self.denoising_pos_params.all_atoms,
+                        )
+                    else:
+                        batch = add_gaussian_noise_schedule_to_position(
+                            batch,
+                            std_low=self.denoising_pos_params.std_low,
+                            std_high=self.denoising_pos_params.std_high,
+                            num_steps=self.denoising_pos_params.num_steps,
+                            corrupt_ratio=self.denoising_pos_params.corrupt_ratio,
+                            all_atoms=self.denoising_pos_params.all_atoms,
+                        )
 
                 # Forward, loss, backward.
                 with torch.cuda.amp.autocast(enabled=self.scaler is not None):
                     out = self._forward(batch)
                     loss = self._compute_loss(out, batch)
-                loss = self.scaler.scale(loss) if self.scaler else loss
-                self._backward(loss)
-                scale = self.scaler.get_scale() if self.scaler else 1.0
 
                 # Compute metrics.
                 self.metrics = self._compute_metrics(
@@ -408,9 +393,10 @@ class DenoisingForcesTrainer(EquiformerV2ForcesTrainer):
                     self.evaluator,
                     self.metrics,
                 )
-                self.metrics = self.evaluator.update(
-                    "loss", loss.item() / scale, self.metrics
-                )
+                self.metrics = self.evaluator.update("loss", loss.item(), self.metrics)
+
+                loss = self.scaler.scale(loss) if self.scaler else loss
+                self._backward(loss)
 
                 # Log metrics.
                 log_dict = {k: self.metrics[k]["metric"] for k in self.metrics}
@@ -450,8 +436,7 @@ class DenoisingForcesTrainer(EquiformerV2ForcesTrainer):
                             )
 
                         val_metrics = self.validate(
-                            split="val",
-                            disable_tqdm=disable_eval_tqdm,
+                            split="val", disable_tqdm=disable_eval_tqdm
                         )
                         self.update_best(
                             primary_metric,
@@ -485,18 +470,6 @@ class DenoisingForcesTrainer(EquiformerV2ForcesTrainer):
             self.val_dataset.close_db()
         if self.config.get("test_dataset", False):
             self.test_dataset.close_db()
-
-    def _denorm_preds(self, target_key: str, prediction: torch.Tensor, batch: Batch):
-        """Convert model output from a batch into raw prediction by denormalizing and adding references"""
-        # denorm the outputs
-        if target_key in self.normalizers:
-            prediction = self.normalizers[target_key](prediction)
-
-        # add element references
-        if target_key in self.elementrefs:
-            prediction = self.elementrefs[target_key](prediction, batch)
-
-        return prediction
 
     def _compute_loss(self, out, batch) -> torch.Tensor:
         batch_size = batch.natoms.numel()
@@ -637,8 +610,12 @@ class DenoisingForcesTrainer(EquiformerV2ForcesTrainer):
 
         return sum(loss)
 
-    def _compute_metrics(self, out, batch, evaluator, metrics={}):
-        # This assumes batch.fixed is specified correctly for each dataset.
+    def _compute_metrics(self, out, batch, evaluator, metrics=None):
+        if metrics is None:
+            metrics = {}
+        # this function changes the values in the out dictionary,
+        # make a copy instead of changing them in the callers version
+        out = {k: v.clone() for k, v in out.items()}
 
         natoms = batch.natoms
         batch_size = natoms.numel()
@@ -727,7 +704,9 @@ class DenoisingForcesTrainer(EquiformerV2ForcesTrainer):
                 else:
                     target = target.view(batch_size, -1)
 
-                out[target_name] = self._denorm_preds(target_name, out[target_name], batch)
+                out[target_name] = self._denorm_preds(
+                    target_name, out[target_name], batch
+                )
                 targets[target_name] = target
 
         targets["natoms"] = natoms
@@ -776,9 +755,6 @@ class DenoisingForcesTrainer(EquiformerV2ForcesTrainer):
 
         predictions = defaultdict(list)
 
-        for key in self.normalizers.keys():
-            self.normalizers[key].to(self.device)
-
         for _, batch in tqdm(
             enumerate(data_loader),
             total=len(data_loader),
@@ -787,10 +763,9 @@ class DenoisingForcesTrainer(EquiformerV2ForcesTrainer):
             disable=disable_tqdm,
         ):
             with torch.cuda.amp.autocast(enabled=self.scaler is not None):
-                batch = batch.to(self.device)
                 out = self._forward(batch)
 
-            for key in out.keys():
+            for key in out:
                 out[key] = out[key].float()
 
             for target_key in self.config["outputs"]:
@@ -811,7 +786,6 @@ class DenoisingForcesTrainer(EquiformerV2ForcesTrainer):
                     else:
                         dtype = torch.float16
 
-                    # pred = pred.cpu().detach().to(dtype)
                     pred = pred.detach().cpu().to(dtype)
 
                     ### Split predictions into per-image predictions
