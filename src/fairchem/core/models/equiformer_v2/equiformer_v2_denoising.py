@@ -120,7 +120,7 @@ class EquiformerV2S_OC20_DenoisingPos(EquiformerV2Backbone):
     def __init__(
         self,
         use_pbc: bool = True,
-        use_pbc_single: bool = False, #new
+        use_pbc_single: bool = True,
         regress_forces: bool = True,
         otf_graph: bool = True,
         max_neighbors: int = 500,
@@ -156,8 +156,9 @@ class EquiformerV2S_OC20_DenoisingPos(EquiformerV2Backbone):
         proj_drop: float = 0.0,
         weight_init: str = "normal",
         enforce_max_neighbors_strictly: bool = True,
-        avg_num_nodes: float | None = None, # =_AVG_NUM_NODES,
-        avg_degree: float | None = None, # =_AVG_DEGREE,
+        avg_num_nodes: float | None = _AVG_NUM_NODES,
+        avg_degree: float | None = _AVG_DEGREE,
+        use_denoising_stress=True,
         use_energy_lin_ref: bool | None = False,
         load_energy_lin_ref: bool | None = False,
         activation_checkpoint: bool | None = False,
@@ -165,7 +166,6 @@ class EquiformerV2S_OC20_DenoisingPos(EquiformerV2Backbone):
         use_force_encoding=True,
         use_noise_schedule_sigma_encoding=False,
         use_denoising_energy=True,
-        use_tp_reparam=False, #TODO: Not used, check if it is deprecated
     ):
         super().__init__(
         use_pbc=use_pbc,
@@ -209,13 +209,14 @@ class EquiformerV2S_OC20_DenoisingPos(EquiformerV2Backbone):
         avg_degree=avg_degree,
         use_energy_lin_ref=use_energy_lin_ref,
         load_energy_lin_ref=load_energy_lin_ref,
-        activation_checkpoint=activation_checkpoint
+        activation_checkpoint=activation_checkpoint,
         )
 
         # for denoising position
         self.use_force_encoding = use_force_encoding
         self.use_noise_schedule_sigma_encoding = use_noise_schedule_sigma_encoding
         self.use_denoising_energy = use_denoising_energy
+        self.use_denoising_stress = use_denoising_stress
 
         # for denoising position, encode node-wise forces as node features
         self.irreps_sh = o3.Irreps.spherical_harmonics(lmax=max(self.lmax_list), p=1)
@@ -478,14 +479,6 @@ class EquiformerV2EnergyHeadDenoising(nn.Module, HeadInterface):
                 f"reduce can only be sum or mean, user provided: {self.reduce}"
             )
 
-        # Add the per-atom linear references to the energy.
-        # if self.use_energy_lin_ref and self.load_energy_lin_ref: #TODO: Check if use_energy_lin_ref is deprecated
-        #     with torch.cuda.amp.autocast(False):
-        #         energy = energy.to(self.energy_lin_ref.dtype).index_add(
-        #             0,
-        #             data.batch,
-        #             self.energy_lin_ref[emb["graph"].atomic_numbers_full,],
-        #         )
         #------------for denoising positions------------------
         # zero out denoising energy for ablation study
         if (
