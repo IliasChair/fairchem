@@ -158,7 +158,6 @@ class EquiformerV2S_OC20_DenoisingPos(EquiformerV2Backbone):
         enforce_max_neighbors_strictly: bool = True,
         avg_num_nodes: float | None = _AVG_NUM_NODES,
         avg_degree: float | None = _AVG_DEGREE,
-        use_denoising_stress=True,
         use_energy_lin_ref: bool | None = False,
         load_energy_lin_ref: bool | None = False,
         activation_checkpoint: bool | None = False,
@@ -216,7 +215,6 @@ class EquiformerV2S_OC20_DenoisingPos(EquiformerV2Backbone):
         self.use_force_encoding = use_force_encoding
         self.use_noise_schedule_sigma_encoding = use_noise_schedule_sigma_encoding
         self.use_denoising_energy = use_denoising_energy
-        self.use_denoising_stress = use_denoising_stress
 
         # for denoising position, encode node-wise forces as node features
         self.irreps_sh = o3.Irreps.spherical_harmonics(lmax=max(self.lmax_list), p=1)
