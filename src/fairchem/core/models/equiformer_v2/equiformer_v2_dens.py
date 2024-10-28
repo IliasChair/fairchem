@@ -100,7 +100,7 @@ class EqV2DeNSBackbone(EquiformerV2Backbone):
         use_force_encoding=True,
         use_noise_schedule_sigma_encoding=False,
         use_denoising_energy=True,
-        use_denoising_stress=True,
+        use_denoising_stress=False,
         use_energy_lin_ref=False,
         load_energy_lin_ref=False,
         activation_checkpoint=False,

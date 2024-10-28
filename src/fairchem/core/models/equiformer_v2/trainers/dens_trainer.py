@@ -166,14 +166,16 @@ def denoising_pos_eval(
         metrics = evaluator.update("denoising_energy_mae", res, metrics)
         res = mae(prediction, target, "forces")
         metrics = evaluator.update("denoising_pos_mae", res, metrics)
-        res = mae(prediction, target, "stress")
-        metrics = evaluator.update("denoising_stress_mae", res, metrics)
+        # disable stress for now
+        # res = mae(prediction, target, "stress")
+        # metrics = evaluator.update("denoising_stress_mae", res, metrics)
     else:
         # Update `denoising_energy_mae`, `denoising_pos_mae` and `denoising_force_mae` if using partially corrupted structures
         res = mae(prediction, target, "energy")
         metrics = evaluator.update("denoising_energy_mae", res, metrics)
-        res = mae(prediction, target, "stress")
-        metrics = evaluator.update("denoising_stress_mae", res, metrics)
+        # disable stress for now
+        # res = mae(prediction, target, "stress")
+        # metrics = evaluator.update("denoising_stress_mae", res, metrics)
         # separate S2EF and denoising positions results based on `noise_mask`
         target_tensor = target["forces"]
         prediction_tensor = prediction["forces"]
