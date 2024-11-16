@@ -1078,6 +1078,7 @@ def new_trainer_context(*, config: dict[str, Any]):
         "slurm": config.get("slurm", {}),
         "name": task_name,
         "gp_gpus": config.get("gp_gpus"),
+        "neb_validation": config.get("neb_validation", {}),
     }
 
     if task_name == "multitask":

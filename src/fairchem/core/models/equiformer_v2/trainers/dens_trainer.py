@@ -23,7 +23,7 @@ from fairchem.core.modules.normalization.normalizer import Normalizer
 from fairchem.core.modules.scaling.util import ensure_fitted
 
 from .forces_trainer import EquiformerV2ForcesTrainer
-
+from typing import Any
 
 @dataclass
 class DenoisingPosParams:
@@ -274,6 +274,7 @@ class DenoisingForcesTrainer(EquiformerV2ForcesTrainer):
         slurm=None,
         gp_gpus=None,
         inference_only: bool = False,
+        neb_validation: dict[str, Any] | None = None,
     ):
         if slurm is None:
             slurm = {}
@@ -299,6 +300,7 @@ class DenoisingForcesTrainer(EquiformerV2ForcesTrainer):
             name=name,
             gp_gpus=gp_gpus,
             inference_only=inference_only,
+            neb_validation=neb_validation,
         )
 
         # for denoising positions
@@ -373,7 +375,7 @@ class DenoisingForcesTrainer(EquiformerV2ForcesTrainer):
                         )
 
                 # Forward, loss, backward.
-                with torch.cuda.amp.autocast(enabled=self.scaler is not None):
+                with torch.autocast('cuda', enabled=self.scaler is not None):
                     out = self._forward(batch)
                     loss = self._compute_loss(out, batch)
 
@@ -756,7 +758,7 @@ class DenoisingForcesTrainer(EquiformerV2ForcesTrainer):
             desc=f"device {rank}",
             disable=disable_tqdm,
         ):
-            with torch.cuda.amp.autocast(enabled=self.scaler is not None):
+            with torch.autocast('cuda', enabled=self.scaler is not None):
                 out = self._forward(batch)
 
             for key in out:

@@ -94,6 +94,7 @@ class OCPTrainer(BaseTrainer):
         slurm=None,
         gp_gpus: int | None = None,
         inference_only: bool = False,
+        neb_validation: dict[str, Any] | None = None,
     ):
         if slurm is None:
             slurm = {}
@@ -119,6 +120,7 @@ class OCPTrainer(BaseTrainer):
             name=name,
             gp_gpus=gp_gpus,
             inference_only=inference_only,
+            neb_validation=neb_validation,
         )
 
     def train(self, disable_eval_tqdm: bool = False) -> None:
