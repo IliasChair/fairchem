@@ -14,7 +14,6 @@ import logging
 import os
 import random
 import sys
-from pathlib import Path
 from abc import ABC, abstractmethod
 from functools import partial
 from itertools import chain
@@ -28,13 +27,6 @@ import yaml
 from torch.nn.parallel.distributed import DistributedDataParallel
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from multiprocessing import cpu_count
-from ase.atoms import Atoms
-from ase.calculators.calculator import Calculator
-from ase.neb import NEB
-from ase.optimize import BFGS
-import ase.io
-from concurrent.futures import ProcessPoolExecutor
 
 from fairchem.core import __version__
 from fairchem.core.common import distutils, gp_utils
@@ -54,7 +46,6 @@ from fairchem.core.common.utils import (
     save_checkpoint,
     update_config,
 )
-from fairchem.core.common.relaxation.ase_utils import OCPCalculator
 from fairchem.core.datasets import data_list_collater
 from fairchem.core.datasets.base_dataset import create_dataset
 from fairchem.core.modules.evaluator import Evaluator
@@ -71,7 +62,7 @@ from fairchem.core.modules.normalization.normalizer import (
 from fairchem.core.modules.scaling.compat import load_scales_compat
 from fairchem.core.modules.scaling.util import ensure_fitted
 from fairchem.core.modules.scheduler import LRScheduler
-from fairchem.core.preprocessing import AtomsToGraphs
+from fairchem.core.trainers.neb_trainer import validate_neb_scans_cpu
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -891,9 +882,9 @@ class BaseTrainer(ABC):
         #----------------------------------------------
         # Add NEB validation if configured
         if self.config.get("neb_validation", False):
-            neb_metrics = self.validate_neb_scans_cpu(
+            neb_metrics = validate_neb_scans_cpu(
                 neb_traj_dir=self.config["neb_validation"]["traj_dir"],
-                num_workers=self.config["neb_validation"].get("num_workers", cpu_count()),
+                num_workers=self.config["neb_validation"].get("num_workers", os.cpu_count()),
                 neb_config=self.config["neb_validation"]["neb_config"],
                 calculator_config=self.config["neb_validation"].get("calculator_config"),
             )
@@ -917,16 +908,6 @@ class BaseTrainer(ABC):
             metrics = self._compute_metrics(out, batch, evaluator, metrics)
             metrics = evaluator.update("loss", loss.item(), metrics)
 
-        # Add NEB validation if configured
-        if self.config.get("neb_validation", False):
-            neb_metrics = self.validate_neb_scans_cpu(
-                neb_traj_dir=self.config["neb_validation"]["traj_dir"],
-                num_workers=self.config["neb_validation"].get("num_workers", cpu_count()),
-                neb_config=self.config["neb_validation"]["neb_config"],
-                calculator_config=self.config["neb_validation"].get("calculator_config"),
-            )
-            metrics.update(neb_metrics)
-
         metrics = self._aggregate_metrics(metrics)
 
         log_dict = {k: metrics[k]["metric"] for k in metrics}
@@ -947,65 +928,6 @@ class BaseTrainer(ABC):
             self.ema.restore()
 
         return metrics
-
-    def validate_neb_scans_cpu(self,
-                            neb_traj_dir:str,
-                            num_workers:int,
-                            neb_config:dict,
-                            calculator_config:dict=None) -> dict:
-        """Run NEB validations in parallel using CPU processes"""
-
-
-        # Prepare trajectory pairs
-        # TODO: check if it is better to read the traj batchwise to reduce memory
-        traj_dir = Path(neb_traj_dir)
-        traj_paths = sorted(traj_dir.glob("*.traj"))
-
-        # Configure worker function
-        with torch.no_grad():
-            worker_fn = partial(_run_single_neb,
-                                n_images=neb_config.get("n_images"),
-                                fmax=neb_config.get("fmax"),
-                                max_steps=neb_config.get("max_steps"),
-                                max_attempts=neb_config.get("max_attemps"),
-                                fmax_adjustment_factor=neb_config.get("fmax_adjustment_factor"),
-                                n_images_increment=neb_config.get("n_images_increment"),
-                                calculator_config=calculator_config
-                                )
-
-            # Run parallel calculations
-            results = []
-            with ProcessPoolExecutor(max_workers=num_workers) as executor:
-                results = list(executor.map(worker_fn, traj_paths))
-
-        # Compute metrics in evaluator format
-        n_total = len(results)
-        n_success = sum(1 for r in results if r['success'])
-        success_rate = n_success / n_total if n_total > 0 else 0.0
-
-        metrics = {
-            "neb_success_rate": {
-                "metric": success_rate,
-                "total": n_success,
-                "numel": n_total
-            }
-        }
-
-        barriers = [r['barrier'] for r in results if r['success'] and r['barrier'] is not None]
-        if barriers:
-            metrics["neb_avg_barrier"] = {
-                "metric": np.mean(barriers),
-                "total": np.sum(barriers),
-                "numel": len(barriers)
-            }
-            metrics["neb_std_barrier"] = {
-                "metric": np.std(barriers),
-                "total": np.sum((np.array(barriers) - np.mean(barriers))**2),
-                "numel": len(barriers)
-            }
-
-        return metrics
-
 
 
     def _backward(self, loss) -> None:
@@ -1082,121 +1004,3 @@ class BaseTrainer(ABC):
             )
             logging.info(f"Writing results to {full_path}")
             np.savez_compressed(full_path, **gather_results)
-
-class MockCalculator(Calculator):
-    implemented_properties = ['energy', 'forces']
-
-    def __init__(self,
-                 parent_trainer: BaseTrainer,
-                 cutoff: int = 6,
-                 max_neighbors: int = 50,
-                 seed: int | None = 42):
-        Calculator.__init__(self)
-        self.parent_trainer = parent_trainer
-
-        self.a2g = AtomsToGraphs(
-            max_neigh=max_neighbors,
-            radius=cutoff,
-            r_energy=False,
-            r_forces=False,
-            r_distances=False,
-            r_edges=False,
-            r_pbc=True,
-        )
-
-
-    def calculate(self, atoms: Atoms, properties, system_changes) -> None:
-        Calculator.calculate(self, atoms, properties, system_changes)
-        data_object = self.a2g.convert(atoms)
-        batch = data_list_collater([data_object], otf_graph=True)
-
-        # with torch.autocast("cuda", enabled=self.scaler is not None):
-        #     batch.to(self.parent_trainer.device)
-        #     predictions = self.parent_trainer._forward(batch)
-        with torch.no_grad():
-            predictions = self.parent_trainer._forward(batch.to('cpu'))
-
-
-
-        for key in predictions:
-            _pred = predictions[key]
-            _pred = _pred.item() if _pred.numel() == 1 else _pred.cpu().numpy()
-            self.results[key] = _pred
-
-def _run_single_neb(traj_paths: Path,
-                    n_images:int=7,
-                    fmax:float=0.05,
-                    max_steps:int = 500,
-                    max_attempts:int=1,
-                    fmax_adjustment_factor=None,
-                    n_images_increment=None,
-                    calculator_config=None):
-    if max_attempts != 1:
-        assert fmax_adjustment_factor is not None, (
-            "fmax_reduction_factor must be provided if max_attempts is "
-            "provided."
-        )
-        assert n_images_increment is not None, (
-            "n_images_increment must be provided if max_attempts is "
-            "provided."
-        )
-
-
-    frames = ase.io.read(traj_paths, index=":")
-    if len(frames) not in [2, 3]:
-        raise ValueError("Trajectory must contain 2 or 3 frames, "
-                        f"found {len(frames)}")
-
-    try:
-        # Set calculator for all frames
-        for frame in frames:
-            # frame.calc = MockCalculator(
-            #     parent_trainer=self,
-            #     cutoff=calculator_config.get("cutoff", None),
-            #     max_neighbors=calculator_config.get("max_neighbors", None),
-            #     seed=calculator_config.get("seed", None)
-            # )
-            frame.calc = OCPCalculator(
-                        #TODO: checkpoint path shoul not be passed this way
-                        checkpoint_path=calculator_config.get("checkpoint_path", None),
-                        cutoff=calculator_config.get("cutoff", None),
-                        max_neighbors=calculator_config.get("max_neighbors", None),
-                        cpu=calculator_config.get("cpu", None),
-                        seed=calculator_config.get("seed", None),
-            )
-
-        # Create NEB images
-        if len(frames) == 2:
-            # Initial and final only
-            images = [frames[0]]
-            images += [frames[0].copy() for _ in range(n_images)]
-            images.append(frames[1])
-        else:
-            # Initial, TS, and final case (3 frames)
-            images = [frames[0]]  # Initial state
-            images += [frames[1].copy() for _ in range(n_images)]  # Copies of TS guess
-            images.append(frames[2])  # Final state
-
-        neb = NEB(images)
-        neb.interpolate()
-
-        # Optimize
-        optimizer = BFGS(neb)
-        optimizer.run(fmax=fmax, steps=max_steps)
-
-        # Extract results
-        if optimizer.converged():
-            energies = [image.get_potential_energy() for image in neb.images]
-            barrier = max(energies) - energies[0]
-            return {
-                'success': True,
-                'barrier': barrier,
-                'energies': energies,
-                'max_force': max([max(abs(image.get_forces().flatten()))
-                                for image in neb.images])
-            }
-
-        return {'success': False, 'barrier': None}
-
-    except Exception as e:
-        return {'success': False, 'barrier': None, 'error': str(e)}
