@@ -111,7 +111,7 @@ def _run_single_freq(
     traj_path: Path, calculator_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Calculate frequencies and metrics for a single structure"""
-
+    print(f"Processing {traj_path.name}")
     # Set up calculator
     with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
         calc = OCPCalculator(**calculator_config)
