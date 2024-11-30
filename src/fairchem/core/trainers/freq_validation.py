@@ -127,7 +127,7 @@ def _run_single_freq(
             mol.calc = calc
 
             # Calculate frequencies
-            vib = Vibrations(mol)
+            vib = Vibrations(mol, name="vib/"+str(mol.info["index"]))
             vib.run()
             calc_freqs = convert_freq_format(vib.get_frequencies())
             # only use the last len(ref_freqs) frequencies
