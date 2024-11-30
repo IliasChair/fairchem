@@ -61,6 +61,7 @@ from fairchem.core.modules.normalization.normalizer import (
 from fairchem.core.modules.scaling.compat import load_scales_compat
 from fairchem.core.modules.scaling.util import ensure_fitted
 from fairchem.core.modules.scheduler import LRScheduler
+from fairchem.core.trainers.freq_validation import validate_freq_scans_cpu
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -874,6 +875,19 @@ class BaseTrainer(ABC):
         rank = distutils.get_rank()
 
         loader = self.val_loader if split == "val" else self.test_loader
+
+
+        #----------------------------------------------
+        # Add frequency validation
+        if self.config.get("freq_validation", False):
+            freq_metrics = validate_freq_scans_cpu(
+                freq_traj_dir=self.config["freq_validation"]["freq_traj_dir"],
+                num_workers=self.config["freq_validation"].get("num_workers", os.cpu_count()),
+                calculator_config=self.config["freq_validation"].get("calculator_config"),
+            )
+            metrics.update(freq_metrics)
+        #----------------------------------------------
+
 
         for _i, batch in tqdm(
             enumerate(loader),
