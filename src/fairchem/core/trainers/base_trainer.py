@@ -846,6 +846,27 @@ class BaseTrainer(ABC):
                     disable_tqdm=disable_eval_tqdm,
                 )
 
+    def update_secondary_metric(
+        self,
+        secondary_metrics,
+        val_metrics,
+        disable_eval_tqdm: bool = True,
+    ) -> None:
+        for metric in secondary_metrics:
+            if (
+                ("mae" in metric or "rmse" in metric)
+                and val_metrics[metric]["metric"] < self.best_secondary_metrics[metric]
+            ) or (
+                ("mae" not in metric and "rmse" not in metric)
+                and val_metrics[metric]["metric"] > self.best_secondary_metrics[metric]
+            ):
+                self.best_secondary_metrics[metric] = val_metrics[metric]["metric"]
+                self.save(
+                metrics=val_metrics,
+                checkpoint_file=f"best_{metric}_checkpoint.pt",
+                training_state=False,
+                )
+
     def _aggregate_metrics(self, metrics):
         aggregated_metrics = {}
         for k in metrics:
@@ -894,11 +915,10 @@ class BaseTrainer(ABC):
             freq_metrics = self.run_batch_freq_analysis(
                 traj_path=freq_validation_config["traj_path"],
                 chunk_size=freq_validation_config.get("chunk_size", 64),
-                num_workers=freq_validation_config.get("num_workers", os.cpu_count()),
+                num_workers=freq_validation_config.get("num_workers", min(8, os.cpu_count())),
                 output_dir=freq_validation_config.get("output_dir", Path("freq_forces")),
                 disable_tqdm=disable_tqdm,
             )
-            metrics.update(freq_metrics)
         #----------------------------------------------
 
         for _i, batch in tqdm(
@@ -918,6 +938,7 @@ class BaseTrainer(ABC):
             metrics = self._compute_metrics(out, batch, evaluator, metrics)
             metrics = evaluator.update("loss", loss.item(), metrics)
 
+        metrics.update(freq_metrics)
         metrics = self._aggregate_metrics(metrics)
 
         log_dict = {k: metrics[k]["metric"] for k in metrics}
@@ -967,7 +988,7 @@ class BaseTrainer(ABC):
         # and store the calculation output in json files
         # Process chunks
         num_atoms = dataset.tot_n_atoms
-        n_its = num_atoms//chunk_size
+        n_its = (6*num_atoms)//chunk_size
         for chunk in tqdm(
             loader,
             total=n_its,
@@ -989,11 +1010,20 @@ class BaseTrainer(ABC):
             torch.cuda.empty_cache()
 
             # Write to JSON
-            for idx, displacement in enumerate(displacements):
-                # Extract forces for this displacement
-                start_idx = idx * len(displacement.vib.atoms)
-                end_idx = start_idx + len(displacement.vib.atoms)
-                disp_forces = forces[start_idx:end_idx]
+            n_atoms_list = chunk["n_atoms_list"]
+            total_atoms = sum(n_atoms_list)
+            len_forces = forces.shape[0]
+            assert len_forces == total_atoms, "Forces shape does not match total atoms"
+            curr_idx = 0
+            for n_atoms, displacement in zip(n_atoms_list, displacements):
+                end_idx = curr_idx + n_atoms
+                disp_forces = forces[curr_idx:end_idx]
+                curr_idx = end_idx
+
+                assert disp_forces.shape == (n_atoms, 3), (
+                    f"Invalid forces shape {disp_forces.shape}, "
+                    "expected ({n_atoms}, 3)"
+                    )
 
                 # Create force dict in ASE format
                 data = {
@@ -1001,13 +1031,13 @@ class BaseTrainer(ABC):
                 }
 
                 # Write to JSON using displacement name
-                atom_index_str = str(displacement.vib.atoms.info["index"])
+                atom_index_str = displacement.vib.atoms.info["index"]
                 json_path = (
                     output_dir
                     / atom_index_str
                     / f"cache.{displacement.name}.json"
                 )
-                os.makedirs(output_dir/ atom_index_str, exist_ok=True)
+                os.makedirs(output_dir / atom_index_str, exist_ok=True)
                 with open(json_path, 'w') as f:
                     json.dump(data, f)
 
@@ -1017,33 +1047,52 @@ class BaseTrainer(ABC):
 
         FREQ_THRESHOLD = 100  # cm^-1
 
-        # array containing rmse, mae, corr, percent_in_thres for each molecule
-        result_per_mol = np.zeros((len(mols), 4))
+        # array containing rmse, mae, percent_in_thres for each molecule
+        result_per_mol = np.zeros((len(mols), 3))
         for i, mol in enumerate(mols):
-            vib = Vibrations(mol, name="vib/"+str(mol.info['index']))
-            ref_freqs = np.array(mol.info["freqs"])
+            vib = Vibrations(mol, name=output_dir / mol.info["index"])
+
+            ref_freqs = np.array(mol.info["vib_freqs"])
             calc_freqs = self.convert_freq_format(vib.get_frequencies())
             # only use the last len(ref_freqs) frequencies
             calc_freqs = calc_freqs[-len(ref_freqs) :]
 
-            rmse = np.sqrt(np.mean((ref_freqs - calc_freqs) ** 2)),
-            mae =  np.mean(np.abs(ref_freqs - calc_freqs)),
-            corr =  pearsonr(ref_freqs, calc_freqs)[0],
+            rmse = np.sqrt(np.mean((ref_freqs - calc_freqs) ** 2))
+            mae =  np.mean(np.abs(ref_freqs - calc_freqs))
             within_threshold = np.abs(ref_freqs - calc_freqs) < FREQ_THRESHOLD
             percent_in_thres = (np.sum(within_threshold) / len(ref_freqs)) * 100
 
-            result_per_mol[i] = [rmse, mae, corr, percent_in_thres]
+            result_per_mol[i] = [rmse, mae, percent_in_thres]
 
         return {
-            "freq_rmse": np.mean(result_per_mol[:, 0]),
-            "freq_mae": np.mean(result_per_mol[:, 1]),
-            "freq_corr": np.mean(result_per_mol[:, 2]),
-            "freq_percent_in_thres": np.mean(result_per_mol[:, 3]),
+            "freq_rmse": self._get_freq_metric(result_per_mol[:, 0]),
+            "freq_mae": self._get_freq_metric(result_per_mol[:, 1]),
+            "freq_percent_in_thres": self._get_freq_metric(result_per_mol[:, 2]),
         }
 
+    def _get_freq_metric(self, arr):
+        """Helper function to calculate metrics for frequency analysis for an array.
+        Only sed in run_batch_freq_analysis to calculate RMSE, MAE, and percent within
+        threshold.
 
+        This method computes basic statistical metrics for a numeric array including
+        the sum, number of elements, and average (sum/length).
 
-    def convert_freq_format(freqs):
+        Args:
+            arr (numpy.ndarray): Input array of numeric values
+
+        Returns:
+            dict: Dictionary containing:
+                - total (float): Sum of all elements in array
+                - numel (int): Number of elements in array
+                - metric (float): Average value (total/numel)
+        """
+        sum = np.sum(arr)
+        numel = len(arr)
+        metric = sum/numel
+        return {"total": sum, "numel": numel, "metric": metric}
+
+    def convert_freq_format(self, freqs):
         """Convert complex frequencies to real numbers and sort them in ascending order.
 
         This function takes complex frequencies and converts them to real numbers based on the
@@ -1184,8 +1233,9 @@ class ChunkedVibrationDataset(IterableDataset):
         with Trajectory(traj_path, mode="r") as traj:
             self.n_frames = len(traj)
 
-        #self.tot_n_atoms = sum(len(atoms) for atoms in ase.io.read(traj_path, index=":"))
-        self.tot_n_atoms = 15115
+        # TODO: replace this, this is a slow hack to get the total number of atoms
+        self.tot_n_atoms = sum(len(atoms) for atoms in ase.io.read(traj_path, index=":"))
+        #self.tot_n_atoms = 15115
         # Create converter
         self.a2g = AtomsToGraphs(
             max_neigh=60,
@@ -1253,7 +1303,7 @@ def collate_vibration_batch(batch):
     """Custom collate function for vibration batches"""
     # Combine all graph data
     all_graph_data = [item for b in batch for item in b["graph_data"]]
-    n_atoms_list = [len(mol) for mol in all_graph_data]
+    n_atoms_list = [data.num_nodes for data in all_graph_data]
     #all_graph_data =  batch["batch_data"]
     # Combine displacements
     all_displacements = [item for b in batch for item in b["disp_info"]]
