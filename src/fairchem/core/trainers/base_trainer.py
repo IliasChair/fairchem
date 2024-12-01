@@ -10,10 +10,12 @@ from __future__ import annotations
 import copy
 import datetime
 import errno
+import json
 import logging
 import os
 import random
 import sys
+from scipy.stats import pearsonr
 from abc import ABC, abstractmethod
 from functools import partial
 from itertools import chain
@@ -30,6 +32,7 @@ from ase.vibrations import Vibrations
 from torch.nn.parallel.distributed import DistributedDataParallel
 from torch.utils.data import DataLoader, IterableDataset
 from tqdm import tqdm
+from pathlib import Path
 
 from fairchem.core import __version__
 from fairchem.core.common import distutils, gp_utils
@@ -70,7 +73,7 @@ from fairchem.core.trainers.freq_validation import validate_freq_scans_cpu
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
-    from pathlib import Path
+
 
 
 @registry.register_trainer("base")
@@ -892,6 +895,7 @@ class BaseTrainer(ABC):
                 traj_path=freq_validation_config["traj_path"],
                 chunk_size=freq_validation_config.get("chunk_size", 64),
                 num_workers=freq_validation_config.get("num_workers", os.cpu_count()),
+                output_dir=freq_validation_config.get("output_dir", Path("freq_forces")),
                 disable_tqdm=disable_tqdm,
             )
             metrics.update(freq_metrics)
@@ -935,17 +939,18 @@ class BaseTrainer(ABC):
 
         return metrics
 
-
+    @torch.no_grad()
     def run_batch_freq_analysis(
             self,
             traj_path: Path,
-            chunk_size: int = 100,
-            num_workers: int = 4,
+            chunk_size: int,
+            num_workers: int,
             disable_tqdm: bool = False,
-            output_dir: Path = Path("freq_forces")
+            output_dir: Path = Path("vib"),
         ) -> dict[str, Any]:
         """Run frequency analysis using chunked processing"""
-
+        if isinstance(output_dir, str):
+            output_dir = Path(output_dir)
         output_dir.mkdir(exist_ok=True)
 
         # Create dataset and loader with custom collate
@@ -956,15 +961,13 @@ class BaseTrainer(ABC):
             collate_fn=collate_vibration_batch
         )
 
-        # Storage for results
-        all_energies = {}
-        all_forces = {}
-
         rank = distutils.get_rank()
 
+        # 1. Run all necessary calculations for frequency analysis in batches
+        # and store the calculation output in json files
         # Process chunks
         num_atoms = dataset.tot_n_atoms
-        n_its = num_atoms*dataset.n_frames//chunk_size
+        n_its = num_atoms//chunk_size
         for chunk in tqdm(
             loader,
             total=n_its,
@@ -981,44 +984,99 @@ class BaseTrainer(ABC):
                 out = self._forward(batch_data)
 
             # Store results
-            energies = out["energy"].cpu().numpy()
             forces = out["forces"].cpu().numpy()
 
-            for i, (mol_idx, disp_idx) in enumerate(zip(
-                chunk["mol_idx"],
-                chunk["disp_idx"]
-            )):
-                if mol_idx not in all_energies:
-                    all_energies[mol_idx] = {}
-                    all_forces[mol_idx] = {}
+            torch.cuda.empty_cache()
 
-                all_energies[mol_idx][disp_idx] = energies[i]
-                all_forces[mol_idx][disp_idx] = forces[i]
+            # Write to JSON
+            for idx, displacement in enumerate(displacements):
+                # Extract forces for this displacement
+                start_idx = idx * len(displacement.vib.atoms)
+                end_idx = start_idx + len(displacement.vib.atoms)
+                disp_forces = forces[start_idx:end_idx]
 
-        # Calculate frequencies per molecule
-        frequencies = []
-        mol_idx = 0
-        while mol_idx in all_energies:
-            # Read molecule again
-            atoms = next(ase.io.iread(traj_path, index=str(mol_idx)))
-            vib = Vibrations(atoms)
+                # Create force dict in ASE format
+                data = {
+                    "forces": self.encode_ndarray(disp_forces)
+                }
 
-            # Get ordered predictions
-            mol_energies = [all_energies[mol_idx][i] for i in range(len(all_energies[mol_idx]))]
-            mol_forces = [all_forces[mol_idx][i] for i in range(len(all_forces[mol_idx]))]
+                # Write to JSON using displacement name
+                atom_index_str = str(displacement.vib.atoms.info["index"])
+                json_path = (
+                    output_dir
+                    / atom_index_str
+                    / f"cache.{displacement.name}.json"
+                )
+                os.makedirs(output_dir/ atom_index_str, exist_ok=True)
+                with open(json_path, 'w') as f:
+                    json.dump(data, f)
 
-            # Calculate frequencies
-            vib._energies = np.array(mol_energies)
-            vib._forces = np.array(mol_forces)
-            freqs = vib.get_frequencies()
-            # sort and convert complex to negative real
-            freqs = np.sort([(-abs(f.imag) if np.iscomplex(f) else f.real) for f in freqs])
-            frequencies.append(freqs)
+        # 2. Read over the trajectory again and use the stored json files to
+        # calculate the frequencies
+        mols = ase.io.read(traj_path, index=":")
 
-            mol_idx += 1
+        FREQ_THRESHOLD = 100  # cm^-1
+
+        # array containing rmse, mae, corr, percent_in_thres for each molecule
+        result_per_mol = np.zeros((len(mols), 4))
+        for i, mol in enumerate(mols):
+            vib = Vibrations(mol, name="vib/"+str(mol.info['index']))
+            ref_freqs = np.array(mol.info["freqs"])
+            calc_freqs = self.convert_freq_format(vib.get_frequencies())
+            # only use the last len(ref_freqs) frequencies
+            calc_freqs = calc_freqs[-len(ref_freqs) :]
+
+            rmse = np.sqrt(np.mean((ref_freqs - calc_freqs) ** 2)),
+            mae =  np.mean(np.abs(ref_freqs - calc_freqs)),
+            corr =  pearsonr(ref_freqs, calc_freqs)[0],
+            within_threshold = np.abs(ref_freqs - calc_freqs) < FREQ_THRESHOLD
+            percent_in_thres = (np.sum(within_threshold) / len(ref_freqs)) * 100
+
+            result_per_mol[i] = [rmse, mae, corr, percent_in_thres]
 
         return {
-            "frequencies": np.array(frequencies)
+            "freq_rmse": np.mean(result_per_mol[:, 0]),
+            "freq_mae": np.mean(result_per_mol[:, 1]),
+            "freq_corr": np.mean(result_per_mol[:, 2]),
+            "freq_percent_in_thres": np.mean(result_per_mol[:, 3]),
+        }
+
+
+
+    def convert_freq_format(freqs):
+        """Convert complex frequencies to real numbers and sort them in ascending order.
+
+        This function takes complex frequencies and converts them to real numbers based on the
+        following rules:
+        - For complex frequencies, converts to negative absolute value of imaginary part
+        - For real frequencies, keeps the real part
+        - Returns the sorted array of converted frequencies
+
+        Parameters
+        ----------
+        freqs : array-like
+            Input array of frequencies that may contain complex numbers
+
+        Returns
+        -------
+        ndarray
+            Sorted array of real numbers derived from input frequencies according to conversion rules
+
+        Examples
+        --------
+        >>> freqs = [1.0, 2.0+3.0j, -4.0-5.0j]
+        >>> convert_freq_format(freqs)
+        array([-5., -3.,  1.])
+        """
+        return np.sort([(-abs(f.imag) if np.iscomplex(f) else f.real) for f in freqs])
+
+    def encode_ndarray(self, arr):
+        return {
+            "__ndarray__": [
+                list(arr.shape),  # Array shape
+                str(arr.dtype),   # Data type
+                arr.flatten().tolist()  # Flattened data
+            ]
         }
 
 
@@ -1160,10 +1218,10 @@ class ChunkedVibrationDataset(IterableDataset):
         chunk_disp_idx = []
 
         for mol_idx, atoms in enumerate(frames, start=start):
-            vib = Vibrations(atoms)
+            vib = Vibrations(atoms, name="vib/"+str(atoms.info['index']))
 
             # Remove double iteration
-            for disp_idx, displacement, disp_atoms in enumerate(vib.iterdisplace()):
+            for disp_idx, (displacement, disp_atoms) in enumerate(vib.iterdisplace()):
                 # Convert atoms to graph data
                 graph_data = self.a2g.convert(disp_atoms)
                 chunk.append(graph_data)
@@ -1195,6 +1253,8 @@ def collate_vibration_batch(batch):
     """Custom collate function for vibration batches"""
     # Combine all graph data
     all_graph_data = [item for b in batch for item in b["graph_data"]]
+    n_atoms_list = [len(mol) for mol in all_graph_data]
+    #all_graph_data =  batch["batch_data"]
     # Combine displacements
     all_displacements = [item for b in batch for item in b["disp_info"]]
     # Combine indices
@@ -1207,6 +1267,7 @@ def collate_vibration_batch(batch):
     return {
         "batch_data": batched_graphs,
         "displacements": all_displacements,
+        "n_atoms_list": n_atoms_list,
         "mol_idx": torch.LongTensor(all_mol_idx),
         "disp_idx": torch.LongTensor(all_disp_idx)
     }
