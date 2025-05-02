@@ -910,6 +910,7 @@ class BaseTrainer(ABC):
 
         #----------------------------------------------
         # Add frequency validation
+        freq_metrics = {}
         if self.config.get("freq_validation", False):
             freq_validation_config = self.config["freq_validation"]
             freq_metrics = self.run_batch_freq_analysis(
