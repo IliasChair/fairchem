@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import datetime
 import errno
+import json
 import logging
 import os
 import random
@@ -18,14 +19,20 @@ from abc import ABC, abstractmethod
 from functools import partial
 from itertools import chain
 from typing import TYPE_CHECKING, Any
+from collections.abc import Iterator
 
+import ase
+import ase.io
 import numpy as np
 import numpy.typing as npt
 import torch
 import yaml
+from ase.io.trajectory import Trajectory
+from ase.vibrations import Vibrations
 from torch.nn.parallel.distributed import DistributedDataParallel
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset
 from tqdm import tqdm
+from pathlib import Path
 
 from fairchem.core import __version__
 from fairchem.core.common import distutils, gp_utils
@@ -61,6 +68,8 @@ from fairchem.core.modules.normalization.normalizer import (
 from fairchem.core.modules.scaling.compat import load_scales_compat
 from fairchem.core.modules.scaling.util import ensure_fitted
 from fairchem.core.modules.scheduler import LRScheduler
+from fairchem.core.preprocessing import AtomsToGraphs
+from fairchem.core.trainers.freq_validation import validate_freq_scans_cpu
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -188,6 +197,9 @@ class BaseTrainer(ABC):
             self.config["val_dataset"] = dataset.get("val", {}) or {}
             self.config["test_dataset"] = dataset.get("test", {}) or {}
             self.config["relax_dataset"] = dataset.get("relax", {}) or {}
+            self.config["freq_validation"] = (
+                dataset.get("freq_validation", {}) or {}
+            )
         else:
             self.config["dataset"] = dataset or {}
 
@@ -839,6 +851,27 @@ class BaseTrainer(ABC):
                     disable_tqdm=disable_eval_tqdm,
                 )
 
+    def update_secondary_metric(
+        self,
+        secondary_metrics,
+        val_metrics,
+        disable_eval_tqdm: bool = True,
+    ) -> None:
+        for metric in secondary_metrics:
+            if (
+                ("mae" in metric or "rmse" in metric)
+                and val_metrics[metric]["metric"] < self.best_secondary_metrics[metric]
+            ) or (
+                ("mae" not in metric and "rmse" not in metric)
+                and val_metrics[metric]["metric"] > self.best_secondary_metrics[metric]
+            ):
+                self.best_secondary_metrics[metric] = val_metrics[metric]["metric"]
+                self.save(
+                metrics=val_metrics,
+                checkpoint_file=f"best_{metric}_checkpoint.pt",
+                training_state=False,
+                )
+
     def _aggregate_metrics(self, metrics):
         aggregated_metrics = {}
         for k in metrics:
@@ -879,6 +912,21 @@ class BaseTrainer(ABC):
 
         loader = self.val_loader if split == "val" else self.test_loader
 
+
+        #----------------------------------------------
+        # Add frequency validation
+        freq_metrics = {}
+        if self.config.get("freq_validation", False):
+            freq_validation_config = self.config["freq_validation"]
+            freq_metrics = self.run_batch_freq_analysis(
+                traj_path=freq_validation_config["traj_path"],
+                chunk_size=freq_validation_config.get("chunk_size", 64),
+                num_workers=freq_validation_config.get("num_workers", min(8, os.cpu_count())),
+                output_dir=freq_validation_config.get("output_dir", Path("freq_forces")),
+                disable_tqdm=disable_tqdm,
+            )
+        #----------------------------------------------
+
         for _i, batch in tqdm(
             enumerate(loader),
             total=len(loader),
@@ -896,6 +944,7 @@ class BaseTrainer(ABC):
             metrics = self._compute_metrics(out, batch, evaluator, metrics)
             metrics = evaluator.update("loss", loss.item(), metrics)
 
+        metrics.update(freq_metrics)
         metrics = self._aggregate_metrics(metrics)
 
         log_dict = {k: metrics[k]["metric"] for k in metrics}
@@ -916,6 +965,161 @@ class BaseTrainer(ABC):
             self.ema.restore()
 
         return metrics
+
+    @torch.no_grad()
+    def run_batch_freq_analysis(
+            self,
+            traj_path: Path,
+            chunk_size: int,
+            num_workers: int,
+            disable_tqdm: bool = False,
+            output_dir: Path = Path("vib"),
+        ) -> dict[str, Any]:
+        """Run frequency analysis using chunked processing"""
+        if isinstance(output_dir, str):
+            output_dir = Path(output_dir)
+        output_dir.mkdir(exist_ok=True)
+
+        # Create dataset and loader with custom collate
+        dataset = ChunkedVibrationDataset(traj_path, chunk_size)
+        loader = DataLoader(
+            dataset,
+            num_workers=num_workers,
+            collate_fn=collate_vibration_batch
+        )
+
+        rank = distutils.get_rank()
+
+        # 1. Run all necessary calculations for frequency analysis in batches
+        # and store the calculation output in json files
+        # Process chunks
+        num_atoms = dataset.tot_n_atoms
+        n_its = (6*num_atoms)//chunk_size
+        for chunk in tqdm(
+            loader,
+            total=n_its,
+            position=rank,
+            desc=f"Freq calc device {rank}",
+            disable=disable_tqdm
+        ):
+            batch_data = chunk["batch_data"]
+            displacements = chunk["displacements"]
+
+            # Get predictions
+            with torch.autocast("cuda", enabled=self.scaler is not None):
+                batch_data.to(self.device)
+                out = self._forward(batch_data)
+
+            # Store results
+            forces = out["forces"].cpu().numpy()
+
+            # convert forces from hartree/A to eV/A
+            forces = forces * 27.211386245988
+
+            torch.cuda.empty_cache()
+
+            # Write to JSON
+            n_atoms_list = chunk["n_atoms_list"]
+            total_atoms = sum(n_atoms_list)
+            len_forces = forces.shape[0]
+            assert (len_forces == total_atoms
+            ), "Forces shape does not match total atoms"
+            curr_idx = 0
+            for n_atoms, displacement in zip(n_atoms_list, displacements):
+                end_idx = curr_idx + n_atoms
+                disp_forces = forces[curr_idx:end_idx]
+                curr_idx = end_idx
+
+                assert disp_forces.shape == (n_atoms, 3), (
+                    f"Invalid forces shape {disp_forces.shape}, "
+                    "expected ({n_atoms}, 3)"
+                    )
+
+                # Create force dict in ASE format
+                data = {
+                    "forces": self.encode_ndarray(disp_forces)
+                }
+
+                # Write to JSON using displacement name
+                atom_index_str = displacement.vib.atoms.info["index"]
+                json_path = (
+                    output_dir
+                    / atom_index_str
+                    / f"cache.{displacement.name}.json"
+                )
+                os.makedirs(output_dir / atom_index_str, exist_ok=True)
+                with open(json_path, 'w') as f:
+                    json.dump(data, f)
+
+        # 2. Read over the trajectory again and use the stored json files to
+        # calculate the frequencies
+        mols = ase.io.read(traj_path, index=":")
+
+        FREQ_THRESHOLD = 100  # cm^-1
+
+        # array containing rmse, mae, percent_in_thres for each molecule
+        result_per_mol = np.zeros((len(mols), 3))
+        for i, mol in enumerate(mols):
+            vib = Vibrations(mol, name=output_dir / mol.info["index"])
+
+            ref_freqs = np.array(mol.info["vib_freqs"])
+            calc_freqs = self.convert_freq_format(vib.get_frequencies())
+            # only use the last len(ref_freqs) frequencies
+            calc_freqs = calc_freqs[-len(ref_freqs) :]
+
+            rmse = np.sqrt(np.mean((ref_freqs - calc_freqs) ** 2))
+            mae =  np.mean(np.abs(ref_freqs - calc_freqs))
+            within_threshold = np.abs(ref_freqs - calc_freqs) < FREQ_THRESHOLD
+            percent_in_thres = (np.sum(within_threshold) / len(ref_freqs)) * 100
+
+            result_per_mol[i] = [rmse, mae, percent_in_thres]
+
+        return {
+            "freq_rmse": self._get_freq_metric(result_per_mol[:, 0]),
+            "freq_mae": self._get_freq_metric(result_per_mol[:, 1]),
+            "freq_percent_in_thres": self._get_freq_metric(result_per_mol[:, 2]),
+        }
+
+    def _get_freq_metric(self, arr):
+        """Helper function to calculate metrics for frequency analysis for an array.
+        Only sed in run_batch_freq_analysis to calculate RMSE, MAE, and percent within
+        threshold.
+
+        This method computes basic statistical metrics for a numeric array including
+        the sum, number of elements, and average (sum/length).
+
+        Args:
+            arr (numpy.ndarray): Input array of numeric values
+
+        Returns:
+            dict: Dictionary containing:
+                - total (float): Sum of all elements in array
+                - numel (int): Number of elements in array
+                - metric (float): Average value (total/numel)
+        """
+        sum = np.sum(arr)
+        numel = len(arr)
+        metric = sum/numel
+        return {"total": sum, "numel": numel, "metric": metric}
+
+    def convert_freq_format(self, freqs):
+        """Convert complex frequencies to real and sort ascending.
+
+        Complex frequencies are converted to the negative absolute value of
+        their imaginary part. Real frequencies are kept as is.
+        """
+        return np.sort([(-abs(f.imag) if np.iscomplex(f) else f.real)
+                        for f in freqs])
+
+    def encode_ndarray(self, arr):
+        return {
+            "__ndarray__": [
+                list(arr.shape),  # Array shape
+                str(arr.dtype),   # Data type
+                arr.flatten().tolist()  # Flattened data
+            ]
+        }
+
 
     def _backward(self, loss) -> None:
         self.optimizer.zero_grad()
@@ -1005,3 +1209,110 @@ class BaseTrainer(ABC):
             )
             logging.info(f"Writing results to {full_path}")
             np.savez_compressed(full_path, **gather_results)
+
+class ChunkedVibrationDataset(IterableDataset):
+    def __init__(self, traj_path: Path, chunk_size: int = 96):
+        """Dataset that loads and processes molecules in chunks
+
+        Parameters
+        ----------
+        traj_path : Path
+            Path to trajectory file
+        chunk_size : int
+            Number of molecules to load at once
+        """
+        self.traj_path = traj_path
+        self.chunk_size = chunk_size
+
+        # Get total number of frames without loading
+        with Trajectory(traj_path, mode="r") as traj:
+            self.n_frames = len(traj)
+
+        # TODO: replace this, this is a slow hack to get the total number of atoms
+        self.tot_n_atoms = sum(len(atoms) for atoms in ase.io.read(traj_path, index=":"))
+        #self.tot_n_atoms = 15115
+        # Create converter
+        self.a2g = AtomsToGraphs(
+            max_neigh=60,
+            radius=15,
+            r_energy=False,
+            r_forces=False,
+            r_distances=False,
+            r_edges=False,
+            r_pbc=True,
+        )
+
+    def __iter__(self) -> Iterator:
+        worker_info = torch.utils.data.get_worker_info()
+
+        # Partition frames among workers
+        if worker_info is None:
+            start, end = 0, self.n_frames
+        else:
+            per_worker = int(np.ceil(self.n_frames / worker_info.num_workers))
+            start = per_worker * worker_info.id
+            end = min(start + per_worker, self.n_frames)
+
+        # Create frame iterator
+        frames = ase.io.iread(self.traj_path, index=f"{start}:{end}")
+
+        # Process frames in chunks
+        chunk = []
+        disp_info = []
+        chunk_mol_idx = []
+        chunk_disp_idx = []
+
+        for mol_idx, atoms in enumerate(frames, start=start):
+            vib = Vibrations(atoms, name="vib/"+str(atoms.info['index']))
+
+            # Remove double iteration
+            for disp_idx, (displacement, disp_atoms) in enumerate(vib.iterdisplace()):
+                # Convert atoms to graph data
+                graph_data = self.a2g.convert(disp_atoms)
+                chunk.append(graph_data)
+                disp_info.append(displacement)
+                chunk_mol_idx.append(mol_idx)
+                chunk_disp_idx.append(disp_idx)
+
+                if len(chunk) >= self.chunk_size:
+                    yield {
+                        "graph_data": chunk,
+                        "disp_info": disp_info,
+                        "mol_idx": chunk_mol_idx,
+                        "disp_idx": chunk_disp_idx
+                    }
+                    chunk = []
+                    disp_info = []
+                    chunk_mol_idx = []
+                    chunk_disp_idx = []
+
+        if chunk:
+            yield {
+                "graph_data": chunk,
+                "disp_info": disp_info,
+                "mol_idx": chunk_mol_idx,
+                "disp_idx": chunk_disp_idx
+            }
+
+def collate_vibration_batch(batch):
+    """Custom collate function for vibration batches"""
+    # Combine all graph data
+    all_graph_data = [item for b in batch for item in b["graph_data"]]
+    n_atoms_list = [data.num_nodes for data in all_graph_data]
+    #all_graph_data =  batch["batch_data"]
+    # Combine displacements
+    all_displacements = [item for b in batch for item in b["disp_info"]]
+    # Combine indices
+    all_mol_idx = [item for b in batch for item in b["mol_idx"]]
+    all_disp_idx = [item for b in batch for item in b["disp_idx"]]
+
+    # Use data_list_collater for graph data
+    batched_graphs = data_list_collater(all_graph_data, otf_graph=True)
+
+    return {
+        "batch_data": batched_graphs,
+        "displacements": all_displacements,
+        "n_atoms_list": n_atoms_list,
+        "mol_idx": torch.LongTensor(all_mol_idx),
+        "disp_idx": torch.LongTensor(all_disp_idx)
+    }

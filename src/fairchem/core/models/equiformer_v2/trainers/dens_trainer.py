@@ -173,11 +173,11 @@ def denoising_pos_eval(
         res = mae(prediction, target, target_name)
         metrics = evaluator.update(f"denoising_{target_name}_mae", res, metrics)
 
-    if target.get("noise_mask") is None:
+    if target.get("noise_mask") is None and "forces" in denoising_targets:
         # Only update`denoising_pos_mae` during denoising positions if not using partially corrupted structures
         res = mae(prediction, target, "forces")
         metrics = evaluator.update("denoising_pos_mae", res, metrics)
-    else:  # Update `denoising_pos_mae` and `denoising_force_mae` if using partially corrupted structures
+    elif "forces" in denoising_targets:  # Update `denoising_pos_mae` and `denoising_force_mae` if using partially corrupted structures
         # separate S2EF and denoising positions results based on `noise_mask`
         target_tensor = target["forces"]
         prediction_tensor = prediction["forces"]
@@ -350,6 +350,13 @@ class DenoisingForcesTrainer(EquiformerV2ForcesTrainer):
             self.best_val_metric = 1e9 if "mae" in primary_metric else -1.0
         else:
             primary_metric = self.primary_metric
+        if "freq_validation" in self.config and \
+            "secondary_metrics" in self.config["freq_validation"]:
+            self.best_secondary_metrics = {
+                metric: 1e9 if "mae" in metric or "rmse" in metric else -1.0
+                for metric in self.config["freq_validation"]["secondary_metrics"]
+            }
+
         self.metrics = {}
 
         # Calculate start_epoch from step instead of loading the epoch number
@@ -453,6 +460,14 @@ class DenoisingForcesTrainer(EquiformerV2ForcesTrainer):
                             val_metrics,
                             disable_eval_tqdm=disable_eval_tqdm,
                         )
+                        # update with secondary metrics if specified
+                        if "freq_validation" in self.config and \
+                            "secondary_metrics" in self.config["freq_validation"]:
+                            self.update_secondary_metric(
+                                self.config["freq_validation"]["secondary_metrics"],
+                                val_metrics,
+                                disable_eval_tqdm=disable_eval_tqdm,
+                            )
 
                     if self.config["task"].get("eval_relaxations", False):
                         if "relax_dataset" not in self.config["task"]:
