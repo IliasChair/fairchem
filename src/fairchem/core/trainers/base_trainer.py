@@ -69,7 +69,6 @@ from fairchem.core.modules.scaling.compat import load_scales_compat
 from fairchem.core.modules.scaling.util import ensure_fitted
 from fairchem.core.modules.scheduler import LRScheduler
 from fairchem.core.preprocessing import AtomsToGraphs
-from fairchem.core.trainers.freq_validation import validate_freq_scans_cpu
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
