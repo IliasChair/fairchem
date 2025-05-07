@@ -20,6 +20,7 @@ from functools import partial
 from itertools import chain
 from typing import TYPE_CHECKING, Any
 from collections.abc import Iterator
+from collections import defaultdict
 
 import ase
 import ase.io
@@ -988,21 +989,24 @@ class BaseTrainer(ABC):
         )
 
         rank = distutils.get_rank()
+        all_molecule_combined_forces = defaultdict(dict)
 
         # 1. Run all necessary calculations for frequency analysis in batches
         # and store the calculation output in json files
         # Process chunks
-        num_atoms = dataset.tot_n_atoms
-        n_its = (6*num_atoms)//chunk_size
+        num_atoms = dataset.tot_n_atoms # This might be an approximation or require careful handling if used for precise sizing
+        # n_its calculation might need adjustment if chunk_size relates to displacements not atoms
+        # For tqdm, total len(loader) is more robust.
         for chunk in tqdm(
             loader,
-            total=n_its,
+            total=len(loader), # Changed from n_its for robustness
             position=rank,
             desc=f"Freq calc device {rank}",
             disable=disable_tqdm
         ):
             batch_data = chunk["batch_data"]
             displacements = chunk["displacements"]
+            n_atoms_list = chunk["n_atoms_list"]
 
             # Get predictions
             with torch.autocast("cuda", enabled=self.scaler is not None):
@@ -1010,45 +1014,38 @@ class BaseTrainer(ABC):
                 out = self._forward(batch_data)
 
             # Store results
-            forces = out["forces"].cpu().numpy()
+            forces_batch = out["forces"].cpu().numpy()
 
-            # convert forces from hartree/A to eV/A
-            forces = forces * 27.211386245988
+            current_force_idx = 0
+            for i in range(len(displacements)):
+                n_a = n_atoms_list[i]
+                displacement_obj = displacements[i]
 
-            torch.cuda.empty_cache()
+                end_force_idx = current_force_idx + n_a
+                disp_forces = forces_batch[current_force_idx:end_force_idx]
+                current_force_idx = end_force_idx
 
-            # Write to JSON
-            n_atoms_list = chunk["n_atoms_list"]
-            total_atoms = sum(n_atoms_list)
-            len_forces = forces.shape[0]
-            assert (len_forces == total_atoms
-            ), "Forces shape does not match total atoms"
-            curr_idx = 0
-            for n_atoms, displacement in zip(n_atoms_list, displacements):
-                end_idx = curr_idx + n_atoms
-                disp_forces = forces[curr_idx:end_idx]
-                curr_idx = end_idx
+                assert disp_forces.shape == (n_a, 3), (
+                    f"Invalid forces shape {disp_forces.shape} for "
+                    f"molecule {displacement_obj.vib.atoms.info.get('index', 'UnknownMol')} "
+                    f"displacement {displacement_obj.name}, expected ({n_a}, 3)"
+                )
 
-                assert disp_forces.shape == (n_atoms, 3), (
-                    f"Invalid forces shape {disp_forces.shape}, "
-                    "expected ({n_atoms}, 3)"
-                    )
+                atom_index_str = displacement_obj.vib.atoms.info["index"]
+                displacement_name_str = displacement_obj.name
 
-                # Create force dict in ASE format
-                data = {
+                all_molecule_combined_forces[atom_index_str][displacement_name_str] = {
                     "forces": self.encode_ndarray(disp_forces)
                 }
 
-                # Write to JSON using displacement name
-                atom_index_str = displacement.vib.atoms.info["index"]
-                json_path = (
-                    output_dir
-                    / atom_index_str
-                    / f"cache.{displacement.name}.json"
-                )
-                os.makedirs(output_dir / atom_index_str, exist_ok=True)
-                with open(json_path, 'w') as f:
-                    json.dump(data, f)
+        torch.cuda.empty_cache()
+
+        # Write combined JSON files for each molecule
+        for atom_index_str, combined_data in all_molecule_combined_forces.items():
+            # ASE Vibrations(name="path/prefix") looks for "path/prefix/combined.json"
+            json_path = output_dir / f"{atom_index_str}/combined.json"
+            with open(json_path, 'w') as f:
+                json.dump(combined_data, f)
 
         # 2. Read over the trajectory again and use the stored json files to
         # calculate the frequencies
