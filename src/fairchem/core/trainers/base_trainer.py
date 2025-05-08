@@ -34,6 +34,8 @@ from torch.nn.parallel.distributed import DistributedDataParallel
 from torch.utils.data import DataLoader, IterableDataset
 from tqdm import tqdm
 from pathlib import Path
+import pandas as pd
+import pickle
 
 from fairchem.core import __version__
 from fairchem.core.common import distutils, gp_utils
@@ -912,20 +914,24 @@ class BaseTrainer(ABC):
 
         loader = self.val_loader if split == "val" else self.test_loader
 
-
-        #----------------------------------------------
+        # ----------------------------------------------
         # Add frequency validation
         freq_metrics = {}
         if self.config.get("freq_validation", False):
-            freq_validation_config = self.config["freq_validation"]
             freq_metrics = self.run_batch_freq_analysis(
-                traj_path=freq_validation_config["traj_path"],
-                chunk_size=freq_validation_config.get("chunk_size", 64),
-                num_workers=freq_validation_config.get("num_workers", min(8, os.cpu_count())),
-                output_dir=freq_validation_config.get("output_dir", Path("freq_forces")),
+                precomputed_data_dir=Path(
+                    self.config["freq_validation"]["precomputed_data_dir"]),
+                traj_path=Path(
+                    self.config["freq_validation"]["traj_path"]),
+                chunk_size=self.config["freq_validation"].get(
+                    "chunk_size", 64),
+                num_workers=self.config["freq_validation"].get(
+                    "num_workers", min(8, os.cpu_count())),
+                output_dir=Path(self.config["freq_validation"].get(
+                    "output_dir", "vib")),
                 disable_tqdm=disable_tqdm,
             )
-        #----------------------------------------------
+        # ----------------------------------------------
 
         for _i, batch in tqdm(
             enumerate(loader),
@@ -969,21 +975,25 @@ class BaseTrainer(ABC):
     @torch.no_grad()
     def run_batch_freq_analysis(
             self,
-            traj_path: Path,
-            chunk_size: int,
+            precomputed_data_dir: Path,
+            traj_path: Path,           # Kept for reading original mols/refs
+            chunk_size: int,           # This will be used as batch_size
             num_workers: int,
             disable_tqdm: bool = False,
             output_dir: Path = Path("vib"),
         ) -> dict[str, Any]:
-        """Run frequency analysis using chunked processing"""
+        """Run frequency analysis using chunked processing of precomputed data."""
         if isinstance(output_dir, str):
             output_dir = Path(output_dir)
         output_dir.mkdir(exist_ok=True)
 
-        # Create dataset and loader with custom collate
-        dataset = ChunkedVibrationDataset(traj_path, chunk_size)
+        # Create dataset using the precomputed data directory
+        dataset = ChunkedVibrationDataset(precomputed_data_dir)
+
+        # Create loader, using chunk_size as the batch_size for efficiency
         loader = DataLoader(
             dataset,
+            batch_size=chunk_size, # Use chunk_size as DataLoader batch_size
             num_workers=num_workers,
             collate_fn=collate_vibration_batch
         )
@@ -994,12 +1004,9 @@ class BaseTrainer(ABC):
         # 1. Run all necessary calculations for frequency analysis in batches
         # and store the calculation output in json files
         # Process chunks
-        num_atoms = dataset.tot_n_atoms # This might be an approximation or require careful handling if used for precise sizing
-        # n_its calculation might need adjustment if chunk_size relates to displacements not atoms
-        # For tqdm, total len(loader) is more robust.
         for chunk in tqdm(
             loader,
-            total=len(loader), # Changed from n_its for robustness
+            total=len(loader),
             position=rank,
             desc=f"Freq calc device {rank}",
             disable=disable_tqdm
@@ -1013,90 +1020,216 @@ class BaseTrainer(ABC):
                 batch_data.to(self.device)
                 out = self._forward(batch_data)
 
-            # Store results
-            forces_batch = out["forces"].cpu().numpy()
+            forces_pred = out.get("forces")
+
+            # Assuming batch_data is the same 'batch' object _denorm_preds expects
+            # and "forces" is the correct target key.
+            forces_denormalized = self._denorm_preds(
+                "forces", forces_pred, batch_data
+            )
+            forces_batch = forces_denormalized.cpu().numpy()
+
+            forces_batch = forces_batch * 27.211396132 # Convert to eV/A
 
             current_force_idx = 0
             for i in range(len(displacements)):
                 n_a = n_atoms_list[i]
                 displacement_obj = displacements[i]
 
-                end_force_idx = current_force_idx + n_a
-                disp_forces = forces_batch[current_force_idx:end_force_idx]
-                current_force_idx = end_force_idx
+                # Ensure forces_batch is not None before attempting to slice
+                if forces_batch is not None:
+                    end_force_idx = current_force_idx + n_a
+                    disp_forces = forces_batch[current_force_idx:end_force_idx]
+                    current_force_idx = end_force_idx
 
-                assert disp_forces.shape == (n_a, 3), (
-                    f"Invalid forces shape {disp_forces.shape} for "
-                    f"molecule {displacement_obj.vib.atoms.info.get('index', 'UnknownMol')} "
-                    f"displacement {displacement_obj.name}, expected ({n_a}, 3)"
-                )
+                    assert disp_forces.shape == (n_a, 3), (
+                        f"Invalid forces shape {disp_forces.shape} for "
+                        f"molecule {displacement_obj.vib.atoms.info.get('index', 'UnknownMol')} "
+                        f"displacement {displacement_obj.name}, expected ({n_a}, 3)"
+                    )
 
-                atom_index_str = displacement_obj.vib.atoms.info["index"]
-                displacement_name_str = displacement_obj.name
+                    atom_index_str = displacement_obj.vib.atoms.info["index"]
+                    displacement_name_str = displacement_obj.name
 
-                all_molecule_combined_forces[atom_index_str][displacement_name_str] = {
-                    "forces": self.encode_ndarray(disp_forces)
-                }
+                    all_molecule_combined_forces[atom_index_str][displacement_name_str] = {
+                        "forces": self.encode_ndarray(disp_forces)
+                    }
+                else:
+                    # Handle the case where forces_batch was None for this chunk
+                    # This might mean skipping this displacement or logging a specific error
+                    logging.warning(
+                        f"Skipping force storage for displacement {displacement_obj.name} "
+                        f"of molecule {displacement_obj.vib.atoms.info.get('index', 'UnknownMol')} "
+                        "due to missing batch forces."
+                    )
 
         torch.cuda.empty_cache()
 
         # Write combined JSON files for each molecule
         for atom_index_str, combined_data in all_molecule_combined_forces.items():
-            # ASE Vibrations(name="path/prefix") looks for "path/prefix/combined.json"
-            json_path = output_dir / f"{atom_index_str}/combined.json"
+            # ASE Vibrations(name="path/prefix") will look for "path/prefix/combined.json"
+            molecule_specific_dir = output_dir / atom_index_str
+            os.makedirs(molecule_specific_dir, exist_ok=True)
+            json_path = molecule_specific_dir / "combined.json"
             with open(json_path, 'w') as f:
                 json.dump(combined_data, f)
 
-        # 2. Read over the trajectory again and use the stored json files to
-        # calculate the frequencies
+        # 2. Read over the original trajectory again using traj_path
         mols = ase.io.read(traj_path, index=":")
 
         FREQ_THRESHOLD = 100  # cm^-1
 
+        # Initialize lists to collect all frequency pairs across molecules
+        all_ref_freqs = []
+        all_calc_freqs = []
+        frequency_data_to_save = [] # List to store dicts for saving
+
         # array containing rmse, mae, percent_in_thres for each molecule
-        result_per_mol = np.zeros((len(mols), 3))
+        # result_per_mol = np.zeros((len(mols), 3)) # No longer needed
         for i, mol in enumerate(mols):
-            vib = Vibrations(mol, name=output_dir / mol.info["index"])
+            # ASE Vibrations(name="path/prefix") will look for "path/prefix/combined.json"
+            vib_name_prefix = str(output_dir / mol.info["index"])
+            vib = Vibrations(mol, name=vib_name_prefix)
 
-            ref_freqs = np.array(mol.info["vib_freqs"])
-            calc_freqs = self.convert_freq_format(vib.get_frequencies())
+            ref_freqs_mol = np.sort(np.array(mol.info["vib_freqs"]))
+            calc_freqs_all = self.convert_freq_format(vib.get_frequencies())
             # only use the last len(ref_freqs) frequencies
-            calc_freqs = calc_freqs[-len(ref_freqs) :]
+            calc_freqs_mol = np.sort(calc_freqs_all[-len(ref_freqs_mol) :])
 
-            rmse = np.sqrt(np.mean((ref_freqs - calc_freqs) ** 2))
-            mae =  np.mean(np.abs(ref_freqs - calc_freqs))
-            within_threshold = np.abs(ref_freqs - calc_freqs) < FREQ_THRESHOLD
-            percent_in_thres = (np.sum(within_threshold) / len(ref_freqs)) * 100
+            # Ensure lengths match before appending (should usually be the case here)
+            if len(ref_freqs_mol) == len(calc_freqs_mol):
+                all_ref_freqs.extend(ref_freqs_mol)
+                all_calc_freqs.extend(calc_freqs_mol)
+                # Append data for saving
+                for ref_freq, calc_freq in zip(ref_freqs_mol, calc_freqs_mol):
+                    frequency_data_to_save.append({
+                        "molecule_id": mol.info["index"],
+                        "reference_frequency_cm-1": ref_freq,
+                        "calculated_frequency_cm-1": calc_freq,
+                    })
+            else:
+                logging.warning(
+                    f"Mismatch in frequency count for molecule {mol.info.get('index', i)}. "
+                    f"Ref: {len(ref_freqs_mol)}, Calc: {len(calc_freqs_mol)}. Skipping."
+                )
 
-            result_per_mol[i] = [rmse, mae, percent_in_thres]
+        # Convert collected lists to numpy arrays
+        all_ref_freqs_np = np.array(all_ref_freqs)
+        all_calc_freqs_np = np.array(all_calc_freqs)
 
-        return {
-            "freq_rmse": self._get_freq_metric(result_per_mol[:, 0]),
-            "freq_mae": self._get_freq_metric(result_per_mol[:, 1]),
-            "freq_percent_in_thres": self._get_freq_metric(result_per_mol[:, 2]),
-        }
+        # Calculate overall metrics if data was collected
+        if all_ref_freqs_np.size > 0:
+            errors = all_calc_freqs_np - all_ref_freqs_np
+            abs_errors = np.abs(errors)
+            squared_errors = errors**2
 
-    def _get_freq_metric(self, arr):
-        """Helper function to calculate metrics for frequency analysis for an array.
-        Only sed in run_batch_freq_analysis to calculate RMSE, MAE, and percent within
-        threshold.
+            total_freqs = len(all_ref_freqs_np)
 
-        This method computes basic statistical metrics for a numeric array including
-        the sum, number of elements, and average (sum/length).
+            mae_total = np.sum(abs_errors)
+            rmse_total_sum_sq = np.sum(squared_errors)
+            threshold_total_count = np.sum(abs_errors < FREQ_THRESHOLD)
 
-        Args:
-            arr (numpy.ndarray): Input array of numeric values
+            mae_metric = mae_total / total_freqs
+            rmse_metric = np.sqrt(rmse_total_sum_sq / total_freqs)
+            percent_metric = (threshold_total_count / total_freqs) * 100
 
-        Returns:
-            dict: Dictionary containing:
-                - total (float): Sum of all elements in array
-                - numel (int): Number of elements in array
-                - metric (float): Average value (total/numel)
+            final_metrics = {
+                "freq_rmse": {
+                    "total": rmse_total_sum_sq,
+                    "numel": total_freqs,
+                    "metric": rmse_metric,
+                },
+                "freq_mae": {
+                    "total": mae_total,
+                    "numel": total_freqs,
+                    "metric": mae_metric,
+                },
+                "freq_percent_in_thres": {
+                    "total": threshold_total_count,
+                    "numel": total_freqs,
+                    "metric": percent_metric,
+                },
+            }
+        else:
+            logging.warning("No frequency data collected for metric calculation.")
+            # Return empty or zeroed metrics to avoid errors downstream
+            final_metrics = {
+                "freq_rmse": {"total": 0.0, "numel": 0, "metric": np.nan},
+                "freq_mae": {"total": 0.0, "numel": 0, "metric": np.nan},
+                "freq_percent_in_thres": {"total": 0.0, "numel": 0, "metric": np.nan},
+            }
+
+        # Save the collected frequency data if any exists
+        if frequency_data_to_save:
+            self._save_frequency_validation_results(frequency_data_to_save)
+
+        logging.info(
+            f"Frequency validation metrics: "
+            f"Freq RMSE: {final_metrics['freq_rmse']['metric']:.4f}, "
+            f"Freq MAE: {final_metrics['freq_mae']['metric']:.4f}, "
+            f"Freq % in threshold: "
+            f"{final_metrics['freq_percent_in_thres']['metric']:.4f}"
+        )
+
+        return final_metrics
+
+    def _save_frequency_validation_results(self, data_list: list[dict]):
+        """Saves the collected frequency data to a CSV file.
+
+        Parameters
+        ----------
+        data_list : list[dict]
+            List of dictionaries containing frequency data with keys:
+            'molecule_id', 'reference_frequency_cm-1', 'calculated_frequency_cm-1'
         """
-        sum = np.sum(arr)
-        numel = len(arr)
-        metric = sum/numel
-        return {"total": sum, "numel": numel, "metric": metric}
+        if not distutils.is_master():
+            return  # Only master process saves the file
+
+        try:
+            # Group frequencies by molecule
+            grouped_data = {}
+            for item in data_list:
+                mol_id = item['molecule_id']
+                if mol_id not in grouped_data:
+                    grouped_data[mol_id] = {
+                        'ref_freqs': [],
+                        'calc_freqs': []
+                    }
+                grouped_data[mol_id]['ref_freqs'].append(item['reference_frequency_cm-1'])
+                grouped_data[mol_id]['calc_freqs'].append(
+                    item['calculated_frequency_cm-1'])
+
+            # Create result rows in the desired format
+            result_rows = []
+            for i, (mol_id, data) in enumerate(grouped_data.items()):
+                # Format frequency lists as strings
+                ref_freqs_str = str(data['ref_freqs']).replace('[', '[').replace(']', ']')
+                calc_freqs_str = str(data['calc_freqs']).replace('[', '[').\
+                    replace(']', ']')
+
+                result_rows.append({
+                    'frame_index': i,
+                    'dft_freqs': ref_freqs_str,
+                    'ocp_freqs': calc_freqs_str,
+                    'calc_time': 0.0  # Placeholder value
+                })
+
+            # Create DataFrame and save to CSV
+            df = pd.DataFrame(result_rows)
+
+            # Define output path using the trainer's results directory and epoch
+            output_filename = f"frequency_validation_epoch_{self.epoch}.csv"
+            output_path = Path(self.config["cmd"]["results_dir"]) / output_filename
+
+            # Ensure directory exists
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # Save to CSV
+            df.to_csv(output_path, index=False)
+            logging.info(f"Saved frequency validation results to: {output_path}")
+
+        except Exception as e:
+            logging.error(f"Failed to save frequency validation results: {e}")
 
     def convert_freq_format(self, freqs):
         """Convert complex frequencies to real and sort ascending.
@@ -1207,108 +1340,87 @@ class BaseTrainer(ABC):
             np.savez_compressed(full_path, **gather_results)
 
 class ChunkedVibrationDataset(IterableDataset):
-    def __init__(self, traj_path: Path, chunk_size: int = 96):
-        """Dataset that loads and processes molecules in chunks
+    def __init__(self, precomputed_data_dir: str | Path):
+        """
+        Loads precomputed vibration displacement and graph data.
+
+        Reads .pkl files generated by precompute_vibration_data.py.
+        Each .pkl file corresponds to one molecule from the original trajectory
+        and contains a list of dictionaries:
+        [{'graph_data': ..., 'displacement_obj': ..., 'n_atoms': ...}, ...]
 
         Parameters
         ----------
-        traj_path : Path
-            Path to trajectory file
-        chunk_size : int
-            Number of molecules to load at once
+        precomputed_data_dir : str | Path
+            Directory containing the precomputed .pkl files.
         """
-        self.traj_path = traj_path
-        self.chunk_size = chunk_size
+        self.data_dir = Path(precomputed_data_dir)
+        if not self.data_dir.is_dir():
+            raise FileNotFoundError(f"Precomputed data directory not found: {self.data_dir}")
 
-        # Get total number of frames without loading
-        with Trajectory(traj_path, mode="r") as traj:
-            self.n_frames = len(traj)
+        # Removed self.delta and self.a2g as they are no longer needed.
+        # chunk_size parameter removed from signature.
 
-        # TODO: replace this, this is a slow hack to get the total number of atoms
-        self.tot_n_atoms = sum(len(atoms) for atoms in ase.io.read(traj_path, index=":"))
-        #self.tot_n_atoms = 15115
-        # Create converter
-        self.a2g = AtomsToGraphs(
-            max_neigh=60,
-            radius=15,
-            r_energy=False,
-            r_forces=False,
-            r_distances=False,
-            r_edges=False,
-            r_pbc=True,
-        )
+        # Load all precomputed items from .pkl files
+        self.precomputed_items = []
+        pkl_files = sorted(list(self.data_dir.glob("*.pkl")))
+        if not pkl_files:
+            raise FileNotFoundError(f"No .pkl files found in {self.data_dir}")
+
+        logging.info(f"Loading precomputed vibration data from {len(pkl_files)} files in {self.data_dir}...")
+        for pkl_file in tqdm(pkl_files, desc="Loading precomputed files"):
+            try:
+                with open(pkl_file, "rb") as f_in:
+                    items_for_molecule = pickle.load(f_in)
+                    if isinstance(items_for_molecule, list):
+                        self.precomputed_items.extend(items_for_molecule)
+                    else:
+                        logging.warning(f"Unexpected data format in {pkl_file}. Expected list, got {type(items_for_molecule)}. Skipping.")
+            except Exception as e:
+                logging.error(f"Failed to load or process {pkl_file}: {e}")
+
+        if not self.precomputed_items:
+            raise ValueError(f"No valid precomputed items loaded from {self.data_dir}")
+        logging.info(f"Finished loading {len(self.precomputed_items)} total precomputed displacement items.")
+
+    def __len__(self):
+        """Return the total number of precomputed displacement items."""
+        return len(self.precomputed_items)
 
     def __iter__(self) -> Iterator:
         worker_info = torch.utils.data.get_worker_info()
 
-        # Partition frames among workers
         if worker_info is None:
-            start, end = 0, self.n_frames
+            iter_start = 0
+            iter_end = len(self.precomputed_items)
         else:
-            per_worker = int(np.ceil(self.n_frames / worker_info.num_workers))
-            start = per_worker * worker_info.id
-            end = min(start + per_worker, self.n_frames)
+            # Split precomputed items among workers
+            num_items = len(self.precomputed_items)
+            per_worker = int(np.ceil(num_items / float(worker_info.num_workers)))
+            worker_id = worker_info.id
+            iter_start = worker_id * per_worker
+            iter_end = min(iter_start + per_worker, num_items)
 
-        # Create frame iterator
-        frames = ase.io.iread(self.traj_path, index=f"{start}:{end}")
+        # Yield individual precomputed displacement items
+        for i in range(iter_start, iter_end):
+            yield self.precomputed_items[i]
 
-        # Process frames in chunks
-        chunk = []
-        disp_info = []
-        chunk_mol_idx = []
-        chunk_disp_idx = []
-
-        for mol_idx, atoms in enumerate(frames, start=start):
-            vib = Vibrations(atoms, name="vib/"+str(atoms.info['index']))
-
-            # Remove double iteration
-            for disp_idx, (displacement, disp_atoms) in enumerate(vib.iterdisplace()):
-                # Convert atoms to graph data
-                graph_data = self.a2g.convert(disp_atoms)
-                chunk.append(graph_data)
-                disp_info.append(displacement)
-                chunk_mol_idx.append(mol_idx)
-                chunk_disp_idx.append(disp_idx)
-
-                if len(chunk) >= self.chunk_size:
-                    yield {
-                        "graph_data": chunk,
-                        "disp_info": disp_info,
-                        "mol_idx": chunk_mol_idx,
-                        "disp_idx": chunk_disp_idx
-                    }
-                    chunk = []
-                    disp_info = []
-                    chunk_mol_idx = []
-                    chunk_disp_idx = []
-
-        if chunk:
-            yield {
-                "graph_data": chunk,
-                "disp_info": disp_info,
-                "mol_idx": chunk_mol_idx,
-                "disp_idx": chunk_disp_idx
-            }
-
-def collate_vibration_batch(batch):
-    """Custom collate function for vibration batches"""
-    # Combine all graph data
-    all_graph_data = [item for b in batch for item in b["graph_data"]]
+def collate_vibration_batch(batch_of_items: list[dict]):
+    """Custom collate function for vibration batches from precomputed items."""
+    # Each item in batch_of_items is a dict from ChunkedVibrationDataset.__iter__
+    all_graph_data = [item["graph_data"] for item in batch_of_items]
+    all_displacements = [item["displacement_obj"] for item in batch_of_items]
+    # n_atoms_list derived from the graph_data, which is reliable
     n_atoms_list = [data.num_nodes for data in all_graph_data]
-    #all_graph_data =  batch["batch_data"]
-    # Combine displacements
-    all_displacements = [item for b in batch for item in b["disp_info"]]
-    # Combine indices
-    all_mol_idx = [item for b in batch for item in b["mol_idx"]]
-    all_disp_idx = [item for b in batch for item in b["disp_idx"]]
 
-    # Use data_list_collater for graph data
+    # otf_graph should ideally be False if graphs are fully precomputed and require no further processing.
+    # However, data_list_collater might still do other important batching operations.
+    # Assuming otf_graph=True is safe, but could be optimized if graphs are truly final.
     batched_graphs = data_list_collater(all_graph_data, otf_graph=True)
 
     return {
         "batch_data": batched_graphs,
-        "displacements": all_displacements,
+        "displacements": all_displacements, # List of ASE Displacement objects
         "n_atoms_list": n_atoms_list,
-        "mol_idx": torch.LongTensor(all_mol_idx),
-        "disp_idx": torch.LongTensor(all_disp_idx)
+        # mol_idx and disp_idx are omitted; essential info is in Displacement objects.
     }
