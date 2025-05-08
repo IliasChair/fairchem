@@ -953,6 +953,16 @@ class BaseTrainer(ABC):
         metrics.update(freq_metrics)
         metrics = self._aggregate_metrics(metrics)
 
+        # Correct the freq_rmse metric after aggregation
+        # The aggregation computes total/numel, which for RMSE's components (sum_sq_err, num_el) results in MSE.
+        # We need to take the square root to get back to RMSE for logging.
+        if "freq_rmse" in metrics and metrics["freq_rmse"]["numel"] > 0:
+            metrics["freq_rmse"]["metric"] = np.sqrt(
+                metrics["freq_rmse"]["metric"]
+            )
+        elif "freq_rmse" in metrics: # Handle case where numel might be 0
+            metrics["freq_rmse"]["metric"] = np.nan
+
         log_dict = {k: metrics[k]["metric"] for k in metrics}
         log_dict.update({"epoch": self.epoch})
         if distutils.is_master():
